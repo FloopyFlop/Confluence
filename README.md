@@ -106,6 +106,28 @@ Console commands:
 - `fault <1-4>` (force a fault output for demo)
 - `clear` (clear forced fault)
 - `inject PARAM=VALUE ...` (send parameter updates to `inject`)
+- `send {json}` (send raw JSON to orchestrator console)
+- `quit`
+
+Example console session:
+```bash
+list
+fault 2
+inject PWM_MAIN_FUNC4=101
+clear
+quit
+```
+
+## Hooks (one-off commands)
+Hooks are small scripts for quick, single-purpose commands. They talk to the orchestrator console.
+
+Induce a motor fault:
+```bash
+python3 confluence/hooks/induce_fault.py --host <DRONE_IP> --port 9000 --motor 1
+```
+
+This is equivalent to sending `fault 1` from the Console. It requires the orchestrator
+to be running with `--console-port` enabled.
 
 ## Inject Command Format
 Publish JSON on `px4_injector/command`:
