@@ -22,6 +22,9 @@ Usage examples:
   # Write combined logs to a file
   ros2 run confluence orchestrator --all --log-file /tmp/confluence_run.txt
 
+  # Enable remote console bridge (for watch/publish/fault)
+  ros2 run confluence orchestrator --all --console-host 0.0.0.0 --console-port 9000
+
 Interactive commands (type in the orchestrator prompt):
   list                    Show running services
   firehose                Attach to firehose output/IO
@@ -31,6 +34,15 @@ Interactive commands (type in the orchestrator prompt):
   attach <name>           Same as typing the service name
   help                    Show help
   quit                    Stop all services and exit
+
+Remote console commands (via TCP):
+  list
+  fault <1-4>
+  clear
+  inject PARAM=VALUE ...
+  watch <topic> <type>
+  unwatch <topic>
+  pub <topic> <type> <json>
 
 While attached:
   - All keystrokes go to the attached service.
@@ -63,6 +75,12 @@ try:
     RCLPY_AVAILABLE = True
 except Exception:
     RCLPY_AVAILABLE = False
+
+try:
+    from rosidl_runtime_py import message_to_ordereddict
+    ROSIDL_AVAILABLE = True
+except Exception:
+    ROSIDL_AVAILABLE = False
 
 
 class ManagedProcess:
@@ -249,6 +267,39 @@ def _print_help():
     _print_line("Detach from service: Ctrl-]")
 
 
+def _import_msg_type(type_str):
+    if not type_str:
+        raise ValueError("type_str required")
+    normalized = type_str.replace("/", ".")
+    if ".msg." not in normalized:
+        if "." in normalized:
+            pkg, name = normalized.rsplit(".", 1)
+            normalized = f"{pkg}.msg.{name}"
+        else:
+            raise ValueError("type_str must be like std_msgs/msg/String")
+    module_name, class_name = normalized.rsplit(".", 1)
+    module = __import__(module_name, fromlist=[class_name])
+    return getattr(module, class_name)
+
+
+def _message_to_dict(msg):
+    if ROSIDL_AVAILABLE:
+        try:
+            return message_to_ordereddict(msg)
+        except Exception:
+            pass
+    return str(msg)
+
+
+def _apply_fields(msg, data):
+    for key, value in data.items():
+        if isinstance(value, dict):
+            sub = getattr(msg, key)
+            _apply_fields(sub, value)
+        else:
+            setattr(msg, key, value)
+
+
 def main(args=None):
     parser = argparse.ArgumentParser(description="Confluence Orchestrator")
     parser.add_argument("--all", action="store_true", help="Start all services")
@@ -292,6 +343,9 @@ def main(args=None):
     ros_node = None
     fault_pub = None
     inject_pub = None
+    topic_subs = {}
+    topic_types = {}
+    topic_pubs = {}
     if console_server is not None:
         if RCLPY_AVAILABLE:
             rclpy.init(args=None)
@@ -343,6 +397,12 @@ def main(args=None):
                 os.killpg(os.getpgid(proc.proc.pid), signal.SIGINT)
             except Exception:
                 pass
+        if ros_node is not None:
+            for sub in list(topic_subs.values()):
+                try:
+                    ros_node.destroy_subscription(sub)
+                except Exception:
+                    pass
         if log_file is not None:
             log_file.flush()
             log_file.close()
@@ -421,6 +481,24 @@ def main(args=None):
                     cast_val = value
                 params[key] = cast_val
             return {"cmd": "set_params", "params": params}
+        if cmd == "watch":
+            if len(parts) < 3:
+                return {"cmd": "watch"}
+            return {"cmd": "watch", "topic": parts[1], "type": parts[2]}
+        if cmd == "unwatch":
+            if len(parts) < 2:
+                return {"cmd": "unwatch"}
+            return {"cmd": "unwatch", "topic": parts[1]}
+        if cmd in ("publish", "pub"):
+            split = line.split(maxsplit=3)
+            if len(split) < 4:
+                return {"cmd": "publish"}
+            _, topic, type_str, raw_json = split
+            try:
+                data = json.loads(raw_json)
+            except Exception:
+                data = raw_json
+            return {"cmd": "publish", "topic": topic, "type": type_str, "data": data}
         return {"cmd": cmd}
 
     def handle_console_command(client, payload):
@@ -468,6 +546,84 @@ def main(args=None):
             inject_pub.publish(ros_msg)
             console_server.send(client, {"type": "ack", "message": "inject sent"})
             return
+        if cmd == "watch":
+            if ros_node is None:
+                console_server.send(client, {"type": "error", "message": "ROS node not available"})
+                return
+            topic = payload.get("topic")
+            type_str = payload.get("type")
+            if not topic or not type_str:
+                console_server.send(client, {"type": "error", "message": "watch requires topic and type"})
+                return
+            try:
+                msg_type = _import_msg_type(type_str)
+            except Exception as exc:
+                console_server.send(client, {"type": "error", "message": f"invalid type: {exc}"})
+                return
+            if topic in topic_subs:
+                try:
+                    ros_node.destroy_subscription(topic_subs[topic])
+                except Exception:
+                    pass
+            def _cb(msg, t=topic):
+                payload = {
+                    "type": "topic",
+                    "topic": t,
+                    "message": _message_to_dict(msg),
+                }
+                console_server.broadcast(payload)
+            sub = ros_node.create_subscription(msg_type, topic, _cb, 10)
+            topic_subs[topic] = sub
+            topic_types[topic] = type_str
+            console_server.send(client, {"type": "ack", "message": f"watching {topic} ({type_str})"})
+            return
+        if cmd == "unwatch":
+            if ros_node is None:
+                console_server.send(client, {"type": "error", "message": "ROS node not available"})
+                return
+            topic = payload.get("topic")
+            if not topic:
+                console_server.send(client, {"type": "error", "message": "unwatch requires topic"})
+                return
+            sub = topic_subs.pop(topic, None)
+            topic_types.pop(topic, None)
+            if sub is not None:
+                try:
+                    ros_node.destroy_subscription(sub)
+                except Exception:
+                    pass
+            console_server.send(client, {"type": "ack", "message": f"unwatched {topic}"})
+            return
+        if cmd == "publish":
+            if ros_node is None:
+                console_server.send(client, {"type": "error", "message": "ROS node not available"})
+                return
+            topic = payload.get("topic")
+            type_str = payload.get("type")
+            data = payload.get("data")
+            if not topic or not type_str or data is None:
+                console_server.send(client, {"type": "error", "message": "publish requires topic, type, data"})
+                return
+            try:
+                msg_type = _import_msg_type(type_str)
+            except Exception as exc:
+                console_server.send(client, {"type": "error", "message": f"invalid type: {exc}"})
+                return
+            pub = topic_pubs.get((topic, type_str))
+            if pub is None:
+                pub = ros_node.create_publisher(msg_type, topic, 10)
+                topic_pubs[(topic, type_str)] = pub
+            try:
+                msg = msg_type()
+                if isinstance(data, dict):
+                    _apply_fields(msg, data)
+                else:
+                    msg.data = data
+                pub.publish(msg)
+                console_server.send(client, {"type": "ack", "message": f"published to {topic}"})
+            except Exception as exc:
+                console_server.send(client, {"type": "error", "message": f"publish failed: {exc}"})
+            return
         console_server.send(client, {"type": "error", "message": f"Unknown command: {cmd}"})
 
     try:
@@ -483,6 +639,11 @@ def main(args=None):
                     if payload is None:
                         continue
                     handle_console_command(client, payload)
+            if ros_node is not None:
+                try:
+                    rclpy.spin_once(ros_node, timeout_sec=0.0)
+                except Exception:
+                    pass
             events = selector.select(timeout=0.1)
             for key, _ in events:
                 if key.data == "stdin":

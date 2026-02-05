@@ -17,8 +17,14 @@ Commands (type at the prompt):
   fault <index>              (1-4)
   clear                       (clears forced fault)
   inject PARAM=VALUE ...      (publishes params to inject service)
+  watch <topic> <type>        (stream a ROS2 topic, e.g. mav/uniform_batch std_msgs/msg/String)
+  unwatch <topic>
+  pub <topic> <type> <json>   (publish raw JSON to a ROS2 topic)
   send {json}                 (send raw JSON command)
   quit
+
+Type format:
+  std_msgs/msg/String  (or std_msgs.msg.String)
 """
 
 import argparse
@@ -71,6 +77,24 @@ def _parse_command(line):
                 cast_val = value
             params[key] = cast_val
         return {"cmd": "set_params", "params": params}
+    if cmd == "watch":
+        if len(parts) < 3:
+            return {"cmd": "watch"}
+        return {"cmd": "watch", "topic": parts[1], "type": parts[2]}
+    if cmd == "unwatch":
+        if len(parts) < 2:
+            return {"cmd": "unwatch"}
+        return {"cmd": "unwatch", "topic": parts[1]}
+    if cmd in ("pub", "publish"):
+        split = line.split(maxsplit=3)
+        if len(split) < 4:
+            return {"cmd": "publish"}
+        _, topic, type_str, raw_json = split
+        try:
+            data = json.loads(raw_json)
+        except Exception:
+            data = raw_json
+        return {"cmd": "publish", "topic": topic, "type": type_str, "data": data}
     if cmd in ("quit", "exit"):
         return {"cmd": "quit"}
     return {"cmd": cmd}
@@ -98,6 +122,10 @@ def _reader(sock):
                 _print(f"Services: {services}")
             elif msg_type in ("info", "ack", "error", "event"):
                 _print(f"{msg_type.upper()}: {payload}")
+            elif msg_type == "topic":
+                topic = payload.get("topic", "?")
+                message = payload.get("message")
+                _print(f"[{topic}] {message}")
             else:
                 _print(str(payload))
 

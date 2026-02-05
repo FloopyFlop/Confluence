@@ -106,6 +106,9 @@ Console commands:
 - `fault <1-4>` (force a fault output for demo)
 - `clear` (clear forced fault)
 - `inject PARAM=VALUE ...` (send parameter updates to `inject`)
+- `watch <topic> <type>` (stream a ROS2 topic, e.g. `mav/uniform_batch std_msgs/msg/String`)
+- `unwatch <topic>`
+- `pub <topic> <type> <json>` (publish to a ROS2 topic)
 - `send {json}` (send raw JSON to orchestrator console)
 - `quit`
 
@@ -114,6 +117,9 @@ Example console session:
 list
 fault 2
 inject PWM_MAIN_FUNC4=101
+watch mav/uniform_batch std_msgs/msg/String
+unwatch mav/uniform_batch
+pub fault_detector/command std_msgs/msg/String {"data":"{\"action\":\"inject_fault\",\"fault_index\":1}"}
 clear
 quit
 ```
@@ -128,6 +134,11 @@ python3 confluence/hooks/induce_fault.py --host <DRONE_IP> --port 9000 --motor 1
 
 This is equivalent to sending `fault 1` from the Console. It requires the orchestrator
 to be running with `--console-port` enabled.
+
+### Console Topic Streaming/Publishing
+To stream or publish a topic from the Console, you must provide the ROS2 message type
+in either `pkg/msg/Type` or `pkg.msg.Type` format (for example `std_msgs/msg/String`).
+For `pub`, the JSON payload is mapped onto ROS message fields (nested dicts are supported).
 
 ## Inject Command Format
 Publish JSON on `px4_injector/command`:
