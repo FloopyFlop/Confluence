@@ -34,9 +34,10 @@ source install/setup.bash
 ```
 
 ## Run (separate terminals)
+Hardware (recommended, on-drone):
 ```bash
-# Firehose (SITL)
-ros2 run confluence firehose --sitl
+# Firehose (hardware serial)
+ros2 run confluence firehose --serial-port /dev/ttyTHS3 --serial-baud 115200
 
 # Uniform Pump
 ros2 run confluence uniform_pump --ros-args -p condensation_mode:=multi_step -p multi_step_count:=3
@@ -44,21 +45,31 @@ ros2 run confluence uniform_pump --ros-args -p condensation_mode:=multi_step -p 
 # Fault Detector
 ros2 run confluence fault_detector --ros-args -p model_path:=/path/to/model.ckpt
 
-# Inject
+# Inject (hardware serial)
+ros2 run confluence inject --serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p use_sitl:=false
+```
+
+SITL (optional, retained for debugging):
+```bash
+ros2 run confluence firehose --sitl
+ros2 run confluence uniform_pump
+ros2 run confluence fault_detector --ros-args -p model_path:=/path/to/model.ckpt
 ros2 run confluence inject --ros-args -p use_sitl:=true
 ```
 
 ## Run (single terminal with orchestrator)
 ```bash
-# Start all services
-ros2 run confluence orchestrator --all
+# Start all services (hardware serial)
+ros2 run confluence orchestrator --all \
+  --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200" \
+  --inject-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p use_sitl:=false"
 
 # Start a subset
 ros2 run confluence orchestrator --services firehose uniform_pump fault_detector
 
 # Pass args to services
 ros2 run confluence orchestrator --all \
-  --firehose-args "--sitl --stream-rate 200" \
+  --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --stream-rate 200" \
   --uniform-pump-args "--ros-args -p condensation_mode:=multi_step -p multi_step_count:=3" \
   --fault-detector-args "--ros-args -p model_path:=/path/to/model.ckpt"
 
