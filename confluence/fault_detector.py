@@ -35,12 +35,14 @@ class FaultDetectorNode(Node):
         self.declare_parameter('output_topic', 'fault_detector/output')
         self.declare_parameter('publish_inject_command', False)
         self.declare_parameter('inject_topic', 'px4_injector/command')
+        self.declare_parameter('command_topic', 'fault_detector/command')
 
         self.model_path = str(self.get_parameter('model_path').value)
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         self.inject_topic = self.get_parameter('inject_topic').value
         self.publish_inject_command = bool(self.get_parameter('publish_inject_command').value)
+        self.command_topic = self.get_parameter('command_topic').value
 
         self._configure_model_spec()
         self.model = self._load_model()
@@ -49,6 +51,12 @@ class FaultDetectorNode(Node):
             String,
             self.input_topic,
             self._batch_callback,
+            10,
+        )
+        self.command_sub = self.create_subscription(
+            String,
+            self.command_topic,
+            self._command_callback,
             10,
         )
         self.result_pub = self.create_publisher(String, self.output_topic, 10)
@@ -151,6 +159,66 @@ class FaultDetectorNode(Node):
             inject_cmd = {
                 'action': 'set_params',
                 'params': param_fix,
+            }
+            inject_msg = String()
+            inject_msg.data = json.dumps(inject_cmd)
+            self.inject_pub.publish(inject_msg)
+
+    def _command_callback(self, msg: String):
+        try:
+            command = json.loads(msg.data)
+        except Exception:
+            self.get_logger().warning('Fault command must be JSON')
+            return
+
+        action = command.get('action', '')
+        if action in ('inject_fault', 'fault'):
+            fault_index = command.get('fault_index')
+            fault_label = command.get('fault_label')
+            params = command.get('params')
+            if fault_index is not None:
+                try:
+                    fault_index = int(fault_index)
+                except Exception:
+                    self.get_logger().warning('fault_index must be an integer')
+                    return
+                if fault_index <= 0:
+                    self._publish_fault(False, 'nominal', {})
+                    return
+                fault_label, params, fault = self.model_interpreter(fault_index)
+                if not fault:
+                    self.get_logger().warning('Invalid fault_index')
+                    return
+            elif fault_label and isinstance(params, dict):
+                fault = True
+            else:
+                self.get_logger().warning('Fault command missing fault_index or fault_label/params')
+                return
+            self._publish_fault(True, fault_label, params)
+            return
+
+        if action in ('clear_fault', 'clear'):
+            self._publish_fault(False, 'nominal', {})
+            return
+
+        self.get_logger().warning(f'Unknown fault command: {action}')
+
+    def _publish_fault(self, fault, label, params):
+        result = {
+            'fault': bool(fault),
+            'fault_label': label or 'nominal',
+            'parameters': params or {},
+            'timestamp': time.time(),
+            'forced': True,
+        }
+        out_msg = String()
+        out_msg.data = json.dumps(result)
+        self.result_pub.publish(out_msg)
+
+        if fault and self.inject_pub is not None and params:
+            inject_cmd = {
+                'action': 'set_params',
+                'params': params,
             }
             inject_msg = String()
             inject_msg.data = json.dumps(inject_cmd)

@@ -39,19 +39,30 @@ While attached:
 """
 
 import argparse
+import json
 import os
+import queue
+import socket
 import shlex
 import signal
 import selectors
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 import pty
 
 DETACH_KEY = 0x1D  # Ctrl-]
 CTRL_C = 0x03
+
+try:
+    import rclpy
+    from std_msgs.msg import String
+    RCLPY_AVAILABLE = True
+except Exception:
+    RCLPY_AVAILABLE = False
 
 
 class ManagedProcess:
@@ -62,6 +73,104 @@ class ManagedProcess:
         self.proc = proc
         self.display_buffer = b""
         self.log_buffer = b""
+
+
+class ConsoleClient:
+    def __init__(self, sock, addr):
+        self.sock = sock
+        self.addr = addr
+        self.lock = threading.Lock()
+
+
+class ConsoleServer:
+    def __init__(self, host, port, command_queue):
+        self.host = host
+        self.port = port
+        self.command_queue = command_queue
+        self.clients = []
+        self.clients_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._server_thread = None
+        self._sock = None
+
+    def start(self):
+        self._server_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._server_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        with self.clients_lock:
+            for client in self.clients:
+                try:
+                    client.sock.close()
+                except Exception:
+                    pass
+            self.clients = []
+
+    def _accept_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.host, self.port))
+        sock.listen(5)
+        sock.settimeout(1.0)
+        self._sock = sock
+        while not self._stop_event.is_set():
+            try:
+                client_sock, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            client = ConsoleClient(client_sock, addr)
+            with self.clients_lock:
+                self.clients.append(client)
+            self.send(client, {"type": "info", "message": "connected"})
+            thread = threading.Thread(target=self._client_loop, args=(client,), daemon=True)
+            thread.start()
+
+    def _client_loop(self, client):
+        try:
+            with client.sock.makefile("r", encoding="utf-8", errors="replace") as reader:
+                for line in reader:
+                    if self._stop_event.is_set():
+                        break
+                    self.command_queue.put((client, line.strip()))
+        finally:
+            self._remove_client(client)
+
+    def _remove_client(self, client):
+        with self.clients_lock:
+            self.clients = [c for c in self.clients if c is not client]
+        try:
+            client.sock.close()
+        except Exception:
+            pass
+
+    def broadcast(self, payload):
+        line = json.dumps(payload) + "\n"
+        data = line.encode("utf-8")
+        with self.clients_lock:
+            clients = list(self.clients)
+        for client in clients:
+            try:
+                with client.lock:
+                    client.sock.sendall(data)
+            except Exception:
+                self._remove_client(client)
+
+    def send(self, client, payload):
+        line = json.dumps(payload) + "\n"
+        data = line.encode("utf-8")
+        try:
+            with client.lock:
+                client.sock.sendall(data)
+        except Exception:
+            self._remove_client(client)
 
 
 def _build_cmd(service, args_str):
@@ -97,7 +206,7 @@ def _print_line(line):
     sys.stdout.flush()
 
 
-def _drain_output(proc, data, attached_name, log_file):
+def _drain_output(proc, data, attached_name, log_file, console_server=None):
     if not data:
         return
 
@@ -107,6 +216,8 @@ def _drain_output(proc, data, attached_name, log_file):
         raw_line, proc.log_buffer = proc.log_buffer.split(b"\n", 1)
         line = raw_line.decode("utf-8", errors="replace")
         _write_log(log_file, proc.name, line)
+        if console_server is not None:
+            console_server.broadcast({"type": "log", "service": proc.name, "line": line})
 
     # Display handling
     if attached_name == proc.name:
@@ -147,6 +258,8 @@ def main(args=None):
     parser.add_argument("--inject-args", default="", help="Args for inject")
     parser.add_argument("--fault-detector-args", default="", help="Args for fault_detector")
     parser.add_argument("--log-file", default="", help="Write combined output to a log file")
+    parser.add_argument("--console-host", default="0.0.0.0", help="Console bind host")
+    parser.add_argument("--console-port", type=int, default=0, help="Console TCP port (0 disables)")
 
     parsed = parser.parse_args(args=args)
 
@@ -169,6 +282,25 @@ def main(args=None):
 
     log_file = _open_log(parsed.log_file)
 
+    command_queue = queue.Queue()
+    console_server = None
+    if parsed.console_port:
+        console_server = ConsoleServer(parsed.console_host, parsed.console_port, command_queue)
+        console_server.start()
+        _print_line(f"Console server listening on {parsed.console_host}:{parsed.console_port}")
+
+    ros_node = None
+    fault_pub = None
+    inject_pub = None
+    if console_server is not None:
+        if RCLPY_AVAILABLE:
+            rclpy.init(args=None)
+            ros_node = rclpy.create_node("confluence_orchestrator_console")
+            fault_pub = ros_node.create_publisher(String, "fault_detector/command", 10)
+            inject_pub = ros_node.create_publisher(String, "px4_injector/command", 10)
+        else:
+            _print_line("Warning: rclpy not available; console commands disabled.")
+
     selector = selectors.DefaultSelector()
     processes = {}
 
@@ -189,6 +321,8 @@ def main(args=None):
         processes[name] = managed
         selector.register(master_fd, selectors.EVENT_READ, data=name)
         _print_line(f"Started {name}: {' '.join(cmd)}")
+        if console_server is not None:
+            console_server.broadcast({"type": "event", "service": name, "event": "started"})
 
     for svc in services:
         start_service(svc)
@@ -212,6 +346,14 @@ def main(args=None):
         if log_file is not None:
             log_file.flush()
             log_file.close()
+        if console_server is not None:
+            console_server.stop()
+        if ros_node is not None:
+            try:
+                ros_node.destroy_node()
+                rclpy.shutdown()
+            except Exception:
+                pass
 
     def handle_command(line):
         nonlocal attached, raw_attrs
@@ -240,9 +382,107 @@ def main(args=None):
         else:
             _print_line(f"Unknown command or service: {cmd}")
 
+    def parse_console_command(line):
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            return None
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except Exception:
+                return {"cmd": "invalid", "raw": line}
+        parts = line.split()
+        cmd = parts[0].lower()
+        if cmd == "list":
+            return {"cmd": "list"}
+        if cmd in ("fault", "inject_fault"):
+            if len(parts) > 1:
+                try:
+                    return {"cmd": "fault", "fault_index": int(parts[1])}
+                except Exception:
+                    return {"cmd": "fault", "fault_label": " ".join(parts[1:])}
+            return {"cmd": "fault"}
+        if cmd in ("clear", "clear_fault"):
+            return {"cmd": "clear_fault"}
+        if cmd in ("set_params", "inject"):
+            params = {}
+            for item in parts[1:]:
+                if "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                try:
+                    if "." in value:
+                        cast_val = float(value)
+                    else:
+                        cast_val = int(value)
+                except Exception:
+                    cast_val = value
+                params[key] = cast_val
+            return {"cmd": "set_params", "params": params}
+        return {"cmd": cmd}
+
+    def handle_console_command(client, payload):
+        if console_server is None:
+            return
+        cmd = payload.get("cmd", "")
+        if cmd == "invalid":
+            console_server.send(client, {"type": "error", "message": "Invalid JSON"})
+            return
+        if cmd == "list":
+            console_server.send(client, {"type": "services", "services": list(processes.keys())})
+            return
+        if cmd == "fault":
+            if fault_pub is None:
+                console_server.send(client, {"type": "error", "message": "Fault publisher not available"})
+                return
+            msg = {"action": "inject_fault"}
+            if "fault_index" in payload:
+                msg["fault_index"] = payload["fault_index"]
+            if "fault_label" in payload:
+                msg["fault_label"] = payload["fault_label"]
+            if "params" in payload:
+                msg["params"] = payload["params"]
+            ros_msg = String()
+            ros_msg.data = json.dumps(msg)
+            fault_pub.publish(ros_msg)
+            console_server.send(client, {"type": "ack", "message": "fault injected"})
+            return
+        if cmd == "clear_fault":
+            if fault_pub is None:
+                console_server.send(client, {"type": "error", "message": "Fault publisher not available"})
+                return
+            ros_msg = String()
+            ros_msg.data = json.dumps({"action": "clear_fault"})
+            fault_pub.publish(ros_msg)
+            console_server.send(client, {"type": "ack", "message": "fault cleared"})
+            return
+        if cmd == "set_params":
+            if inject_pub is None:
+                console_server.send(client, {"type": "error", "message": "Inject publisher not available"})
+                return
+            params = payload.get("params", {})
+            ros_msg = String()
+            ros_msg.data = json.dumps({"action": "set_params", "params": params})
+            inject_pub.publish(ros_msg)
+            console_server.send(client, {"type": "ack", "message": "inject sent"})
+            return
+        console_server.send(client, {"type": "error", "message": f"Unknown command: {cmd}"})
+
     try:
         _print_help()
         while processes:
+            if console_server is not None:
+                while True:
+                    try:
+                        client, line = command_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    payload = parse_console_command(line)
+                    if payload is None:
+                        continue
+                    handle_console_command(client, payload)
             events = selector.select(timeout=0.1)
             for key, _ in events:
                 if key.data == "stdin":
@@ -277,7 +517,7 @@ def main(args=None):
                     except OSError:
                         data = b""
                     if data:
-                        _drain_output(proc, data, attached, log_file)
+                        _drain_output(proc, data, attached, log_file, console_server)
                     else:
                         selector.unregister(proc.master_fd)
                         os.close(proc.master_fd)
@@ -285,6 +525,8 @@ def main(args=None):
                         if rc is None:
                             rc = proc.proc.wait(timeout=1)
                         _print_line(f"{name} exited with code {rc}")
+                        if console_server is not None:
+                            console_server.broadcast({"type": "event", "service": name, "event": "exited", "code": rc})
                         if attached == name:
                             _restore_term(sys.stdin.fileno(), raw_attrs)
                             raw_attrs = None
@@ -296,6 +538,8 @@ def main(args=None):
                     selector.unregister(proc.master_fd)
                     os.close(proc.master_fd)
                     _print_line(f"{name} exited with code {proc.proc.returncode}")
+                    if console_server is not None:
+                        console_server.broadcast({"type": "event", "service": name, "event": "exited", "code": proc.proc.returncode})
                     if attached == name:
                         _restore_term(sys.stdin.fileno(), raw_attrs)
                         raw_attrs = None

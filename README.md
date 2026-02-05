@@ -18,6 +18,7 @@ ROS2 microservices for the Waterfall stack, rebuilt to use ROS2 pub/sub while pr
   - `mav/uniform_batch` (`std_msgs/String`, JSON payload with `data` + `_batch_metadata`)
 - Fault Detector subscribes:
   - `mav/uniform_batch`
+  - `fault_detector/command` (optional; for remote fault injection)
 - Fault Detector publishes:
   - `fault_detector/output` (`std_msgs/String`, JSON fault payload)
   - Optionally `px4_injector/command` when `publish_inject_command:=true`
@@ -85,6 +86,26 @@ Orchestrator interactive commands:
 - `quit`
 
 While attached: press `Ctrl-]` to detach, `Ctrl-C` to stop all services.
+
+## Remote Console (off-drone)
+Run the orchestrator on the drone with the console port enabled:
+```bash
+ros2 run confluence orchestrator --all \
+  --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200" \
+  --inject-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p use_sitl:=false" \
+  --console-host 0.0.0.0 --console-port 9000
+```
+
+Then on your laptop (same network), run:
+```bash
+python3 Console/console.py --host <DRONE_IP> --port 9000
+```
+
+Console commands:
+- `list`
+- `fault <1-4>` (force a fault output for demo)
+- `clear` (clear forced fault)
+- `inject PARAM=VALUE ...` (send parameter updates to `inject`)
 
 ## Inject Command Format
 Publish JSON on `px4_injector/command`:
