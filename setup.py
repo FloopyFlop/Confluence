@@ -5,7 +5,7 @@ package_name = 'confluence'
 setup(
     name=package_name,
     version='0.0.0',
-    packages=find_packages(),
+    packages=find_packages(include=[package_name, f"{package_name}.*"]),
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -15,6 +15,7 @@ setup(
         'setuptools',
         'pymavlink>=2.4.40',
         'numpy',
+        'pyserial',
     ],
     extras_require={
         'torch': ['torch'],
