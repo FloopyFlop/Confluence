@@ -33,8 +33,8 @@ class FaultDetectorNode(Node):
         self.declare_parameter('model_path', 'models/classifier_3ts.ckpt')
         self.declare_parameter('input_topic', 'mav/uniform_batch')
         self.declare_parameter('output_topic', 'fault_detector/output')
-        # Production default: model-driven fixes are enabled.
-        self.declare_parameter('publish_inject_command', True)
+        # Safe default: only manual fault commands inject; model output is publish-only.
+        self.declare_parameter('publish_inject_command', False)
         self.declare_parameter('inject_topic', 'px4_injector/command')
         self.declare_parameter('command_topic', 'fault_detector/command')
         # Demo mode can set this true; production keeps inference active.
