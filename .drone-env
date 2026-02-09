@@ -1,6 +1,6 @@
 # Confluence drone runtime defaults.
 # These values are consumed automatically by:
-# - ros2 run confluence monolithic_fault
+# - ros2 run confluence fault_hook
 # - ros2 run confluence inject
 # - ros2 run confluence orchestrator
 

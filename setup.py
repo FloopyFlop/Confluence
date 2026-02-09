@@ -36,8 +36,9 @@ setup(
             'inject = confluence.inject:main',
             'fault_detector = confluence.fault_detector:main',
             'orchestrator = confluence.orchestrator:main',
-            'monolithic_fault = confluence.hooks.monolithic_fault:main',
-            'induce_fault = confluence.hooks.induce_fault:main',
+            'fault_hook = confluence.hooks.fault_hook:main',
+            # Backward-compatible alias.
+            'monolithic_fault = confluence.hooks.fault_hook:main',
         ],
     },
 )

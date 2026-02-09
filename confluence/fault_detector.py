@@ -39,6 +39,12 @@ class FaultDetectorNode(Node):
         self.declare_parameter('command_topic', 'fault_detector/command')
         # Demo mode can set this true; production keeps inference active.
         self.declare_parameter('pause_inference_on_forced_fault', False)
+        # Production default: clear should restore standard motor mappings.
+        self.declare_parameter('clear_restores_params', True)
+        self.declare_parameter(
+            'clear_restore_params_json',
+            '{"PWM_MAIN_FUNC1": 101, "PWM_MAIN_FUNC2": 102, "PWM_MAIN_FUNC3": 103, "PWM_MAIN_FUNC4": 104}',
+        )
 
         self.model_path = str(self.get_parameter('model_path').value)
         self.input_topic = self.get_parameter('input_topic').value
@@ -49,8 +55,15 @@ class FaultDetectorNode(Node):
         self.pause_inference_on_forced_fault = bool(
             self.get_parameter('pause_inference_on_forced_fault').value
         )
+        self.clear_restores_params = bool(
+            self.get_parameter('clear_restores_params').value
+        )
+        self.clear_restore_params = self._parse_restore_params(
+            str(self.get_parameter('clear_restore_params_json').value)
+        )
         self._last_vector_warn = 0.0
         self._forced_fault_active = False
+        self._last_model_fault_state = None
 
         self._configure_model_spec()
         self.model = self._load_model()
@@ -72,6 +85,19 @@ class FaultDetectorNode(Node):
         self.inject_pub = self.create_publisher(String, self.inject_topic, 10)
 
         self.get_logger().info('Fault Detector started')
+        self.get_logger().info(
+            f'Clear restore enabled={self.clear_restores_params} params={self.clear_restore_params}'
+        )
+
+    def _parse_restore_params(self, raw):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        self.get_logger().warning('Invalid clear_restore_params_json; using empty restore map')
+        return {}
 
     def _configure_model_spec(self):
         if '3ts' in self.model_path:
@@ -164,6 +190,7 @@ class FaultDetectorNode(Node):
         out_msg = String()
         out_msg.data = json.dumps(result)
         self.result_pub.publish(out_msg)
+        self._log_model_fault_state(fault, label or 'nominal', param_fix or {})
 
         # Model-driven injection is optional and gated by publish_inject_command.
         if fault and self.publish_inject_command and self.inject_pub is not None:
@@ -174,6 +201,19 @@ class FaultDetectorNode(Node):
             inject_msg = String()
             inject_msg.data = json.dumps(inject_cmd)
             self.inject_pub.publish(inject_msg)
+            self.get_logger().warning(f'Model-driven inject command published: {inject_cmd}')
+
+    def _log_model_fault_state(self, fault, label, params):
+        state = (bool(fault), str(label))
+        if state == self._last_model_fault_state:
+            return
+        self._last_model_fault_state = state
+        if fault:
+            self.get_logger().warning(
+                f'Model fault detected: label={label} params={params}'
+            )
+        else:
+            self.get_logger().info('Model output nominal')
 
     def _command_callback(self, msg: String):
         try:
@@ -207,12 +247,30 @@ class FaultDetectorNode(Node):
                 return
             self._forced_fault_active = True
             apply_inject = bool(command.get('apply_inject', True))
+            self.get_logger().warning(
+                f'Forced fault injected: label={fault_label} params={params} apply_inject={apply_inject}'
+            )
             self._publish_fault(True, fault_label, params, apply_inject=apply_inject)
             return
 
         if action in ('clear_fault', 'clear'):
             self._forced_fault_active = False
+            restore = bool(command.get('restore', self.clear_restores_params))
+            restore_params = command.get('restore_params')
+            if not isinstance(restore_params, dict):
+                restore_params = self.clear_restore_params if restore else {}
+            self.get_logger().info(
+                f'Forced fault cleared. restore={restore} restore_params={restore_params}'
+            )
             self._publish_fault(False, 'nominal', {}, apply_inject=False)
+            if restore and restore_params and self.inject_pub is not None:
+                inject_msg = String()
+                inject_msg.data = json.dumps({
+                    'action': 'set_params',
+                    'params': restore_params,
+                })
+                self.inject_pub.publish(inject_msg)
+                self.get_logger().info('Published restore params after clear_fault')
             return
 
         self.get_logger().warning(f'Unknown fault command: {action}')

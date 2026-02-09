@@ -23,15 +23,17 @@ list
 watch px4_injector/status std_msgs/msg/String
 fault 1
 clear
+# optional: clear without restore
+send {"cmd":"clear_fault","restore":false}
 ```
 
 Important:
 - `fault <n>` publishes a forced fault event and injects fault params by default.
 - `clear` clears forced-fault state in the detector.
-- `clear` does not automatically restore PWM params.
+- `clear` restores default motor params (`PWM_MAIN_FUNC1..4`) by default.
 - Parameter writes from console/fault detector are executed by `firehose` on `px4_injector/command` so only one service owns the MAVLink serial link.
 
-Restore command template:
+Manual restore command template:
 ```text
 inject PWM_MAIN_FUNC1=101 PWM_MAIN_FUNC2=102 PWM_MAIN_FUNC3=103 PWM_MAIN_FUNC4=104
 ```
@@ -39,6 +41,21 @@ inject PWM_MAIN_FUNC1=101 PWM_MAIN_FUNC2=102 PWM_MAIN_FUNC3=103 PWM_MAIN_FUNC4=1
 Verification:
 - Watch `px4_injector/status` and confirm each param has `"ok": true`.
 - If you see `"ok": false` with `"reason": "no_response"` or `"reason": "not_connected"`, the FC write did not apply.
+
+QGC actuator test mode:
+- If QGroundControl "Actuator sliders are enabled", motor test commands can override normal motor behavior.
+- Disable from Confluence console:
+```text
+inject COM_MOT_TEST_EN=0
+# or shorthand
+motortest off
+```
+- Re-enable actuator test mode:
+```text
+inject COM_MOT_TEST_EN=1
+# or shorthand
+motortest on
+```
 
 ## Standard Commands
 Start stack (from `.drone-env` defaults):
@@ -49,6 +66,8 @@ ros2 run confluence orchestrator --all
 Note:
 - `orchestrator` reads `.drone-env` from your current working directory.
 - If your env file is elsewhere, pass it explicitly: `--env-file /path/to/.drone-env`
+- Console bridge starts by default on `0.0.0.0:9000` (or `CONFLUENCE_CONSOLE_HOST/PORT`).
+- Disable console bridge with `--console-port 0`.
 
 Override any defaults:
 ```bash
@@ -57,14 +76,14 @@ ros2 run confluence orchestrator --all \
   --console-port 9001
 ```
 
-One-shot monolithic injection:
+One-shot local fault hook (param write + readback verify):
 ```bash
-ros2 run confluence monolithic_fault
+ros2 run confluence fault_hook
 ```
 
-Console fault hook:
+Remote fault hook (sends `fault <motor>` to orchestrator console):
 ```bash
-ros2 run confluence induce_fault --host <DRONE_IP> --port 9000 --motor 1
+ros2 run confluence fault_hook --mode remote --host <DRONE_IP> --port 9000 --motor 1
 ```
 
 ## Service Nodes
@@ -79,7 +98,7 @@ Path:
 - `/Users/abm/XVOL/Cornell/MAGPIE/Confluence/.drone-env`
 
 Used by:
-- `monolithic_fault`
+- `fault_hook`
 - `inject`
 - `orchestrator`
 

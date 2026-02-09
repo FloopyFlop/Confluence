@@ -15,8 +15,9 @@ Usage examples:
 Commands (type at the prompt):
   list
   fault <index>              (1-4)
-  clear                       (clears forced fault)
+  clear                       (clears forced fault and triggers restore params)
   inject PARAM=VALUE ...      (publishes params to inject service)
+  motortest <on|off>          (sets COM_MOT_TEST_EN=1/0)
   watch <topic> <type>        (stream a ROS2 topic, e.g. mav/uniform_batch std_msgs/msg/String)
   unwatch <topic>
   pub <topic> <type> <json>   (publish raw JSON to a ROS2 topic)
@@ -45,6 +46,7 @@ def _print_help():
     _print("  fault <index>")
     _print("  clear")
     _print("  inject PARAM=VALUE ...")
+    _print("  motortest <on|off>")
     _print("  watch <topic> <type>")
     _print("  unwatch <topic>")
     _print("  pub <topic> <type> <json>")
@@ -92,6 +94,15 @@ def _parse_command(line):
                 cast_val = value
             params[key] = cast_val
         return {"cmd": "set_params", "params": params}
+    if cmd == "motortest":
+        if len(parts) < 2:
+            return {"cmd": "motortest"}
+        state = parts[1].strip().lower()
+        if state in ("on", "enable", "enabled", "1", "true"):
+            return {"cmd": "set_params", "params": {"COM_MOT_TEST_EN": 1}}
+        if state in ("off", "disable", "disabled", "0", "false"):
+            return {"cmd": "set_params", "params": {"COM_MOT_TEST_EN": 0}}
+        return {"cmd": "motortest", "value": state}
     if cmd == "watch":
         if len(parts) < 3:
             return {"cmd": "watch"}

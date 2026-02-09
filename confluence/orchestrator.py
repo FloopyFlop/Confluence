@@ -22,8 +22,9 @@ Usage examples:
   # Write combined logs to a file
   ros2 run confluence orchestrator --all --log-file /tmp/confluence_run.txt
 
-  # Enable remote console bridge (for watch/publish/fault)
-  ros2 run confluence orchestrator --all --console-host 0.0.0.0 --console-port 9000
+  # Remote console bridge is enabled by default on 0.0.0.0:9000.
+  # Disable it explicitly:
+  ros2 run confluence orchestrator --all --console-port 0
 
 Interactive commands (type in the orchestrator prompt):
   list                    Show running services
@@ -356,7 +357,12 @@ def main(args=None):
     parser.add_argument("--fault-detector-args", default=None, help="Args for fault_detector")
     parser.add_argument("--log-file", default="", help="Write combined output to a log file")
     parser.add_argument("--console-host", default=None, help="Console bind host")
-    parser.add_argument("--console-port", type=int, default=None, help="Console TCP port (0 disables)")
+    parser.add_argument(
+        "--console-port",
+        type=int,
+        default=None,
+        help="Console TCP port (default 9000, 0 disables)",
+    )
 
     parsed = parser.parse_args(args=args)
     env_values = _load_env_file(parsed.env_file)
@@ -377,7 +383,7 @@ def main(args=None):
         parsed.console_host, env_values, "CONFLUENCE_CONSOLE_HOST", "0.0.0.0"
     )
     console_port = _env_int(
-        parsed.console_port, env_values, "CONFLUENCE_CONSOLE_PORT", 0
+        parsed.console_port, env_values, "CONFLUENCE_CONSOLE_PORT", 9000
     )
 
     services = []
@@ -547,6 +553,15 @@ def main(args=None):
                     cast_val = value
                 params[key] = cast_val
             return {"cmd": "set_params", "params": params}
+        if cmd == "motortest":
+            if len(parts) < 2:
+                return {"cmd": "motortest"}
+            state = parts[1].strip().lower()
+            if state in ("on", "enable", "enabled", "1", "true"):
+                return {"cmd": "set_params", "params": {"COM_MOT_TEST_EN": 1}}
+            if state in ("off", "disable", "disabled", "0", "false"):
+                return {"cmd": "set_params", "params": {"COM_MOT_TEST_EN": 0}}
+            return {"cmd": "motortest", "value": state}
         if cmd == "watch":
             if len(parts) < 3:
                 return {"cmd": "watch"}
@@ -600,7 +615,13 @@ def main(args=None):
                 console_server.send(client, {"type": "error", "message": "Fault publisher not available"})
                 return
             ros_msg = String()
-            ros_msg.data = json.dumps({"action": "clear_fault"})
+            clear_cmd = {"action": "clear_fault"}
+            if "restore" in payload:
+                clear_cmd["restore"] = bool(payload.get("restore"))
+            restore_params = payload.get("restore_params")
+            if isinstance(restore_params, dict):
+                clear_cmd["restore_params"] = restore_params
+            ros_msg.data = json.dumps(clear_cmd)
             fault_pub.publish(ros_msg)
             console_server.send(client, {"type": "ack", "message": "fault cleared"})
             return
@@ -613,6 +634,9 @@ def main(args=None):
             ros_msg.data = json.dumps({"action": "set_params", "params": params})
             inject_pub.publish(ros_msg)
             console_server.send(client, {"type": "ack", "message": "inject sent"})
+            return
+        if cmd == "motortest":
+            console_server.send(client, {"type": "error", "message": "Usage: motortest on|off"})
             return
         if cmd == "watch":
             if ros_node is None:

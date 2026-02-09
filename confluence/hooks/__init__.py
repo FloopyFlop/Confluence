@@ -1,1 +1,1 @@
-__all__ = ["induce_fault", "monolithic_fault"]
+__all__ = ["fault_hook"]

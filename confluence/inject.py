@@ -4,7 +4,7 @@ ROS2 Inject node.
 
 Single responsibility:
 - Subscribe to `px4_injector/direct_command`
-- Apply MAVLink PARAM_SET using the same logic as `monolithic_fault`
+- Apply MAVLink PARAM_SET using the same logic as `fault_hook`
 - Publish result on `px4_injector/direct_status`
 """
 

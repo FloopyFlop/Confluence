@@ -2,7 +2,7 @@
 Shared MAVLink parameter injection utilities.
 
 This module centralizes the exact PARAM_SET + PARAM_REQUEST_READ flow used by
-`monolithic_fault` so both one-shot hooks and ROS services use the same logic.
+`fault_hook` so both one-shot hooks and ROS services use the same logic.
 """
 
 from __future__ import annotations
