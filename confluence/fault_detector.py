@@ -33,11 +33,12 @@ class FaultDetectorNode(Node):
         self.declare_parameter('model_path', 'models/classifier_3ts.ckpt')
         self.declare_parameter('input_topic', 'mav/uniform_batch')
         self.declare_parameter('output_topic', 'fault_detector/output')
-        # Controls model-driven auto injection. Forced console faults can still inject.
-        self.declare_parameter('publish_inject_command', False)
+        # Production default: model-driven fixes are enabled.
+        self.declare_parameter('publish_inject_command', True)
         self.declare_parameter('inject_topic', 'px4_injector/command')
         self.declare_parameter('command_topic', 'fault_detector/command')
-        self.declare_parameter('pause_inference_on_forced_fault', True)
+        # Demo mode can set this true; production keeps inference active.
+        self.declare_parameter('pause_inference_on_forced_fault', False)
 
         self.model_path = str(self.get_parameter('model_path').value)
         self.input_topic = self.get_parameter('input_topic').value
@@ -251,10 +252,10 @@ class FaultDetectorNode(Node):
         ]
 
         parameter_fix = [
-            {'PWM_MAIN_FUNC4': 101},
-            {'PWM_MAIN_FUNC1': 102},
-            {'PWM_MAIN_FUNC2': 103},
-            {'PWM_MAIN_FUNC3': 104},
+            {'PWM_MAIN_FUNC1': 0},
+            {'PWM_MAIN_FUNC2': 0},
+            {'PWM_MAIN_FUNC3': 0},
+            {'PWM_MAIN_FUNC4': 0},
         ]
 
         idx = int(output - 1)

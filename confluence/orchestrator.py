@@ -83,6 +83,51 @@ except Exception:
     ROSIDL_AVAILABLE = False
 
 
+def _load_env_file(path):
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        return {}
+
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export ") :].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    values[key] = value
+    except Exception:
+        return {}
+    return values
+
+
+def _env_or_default(explicit, env_values, key, default):
+    if explicit is not None:
+        return explicit
+    return env_values.get(key, default)
+
+
+def _env_int(explicit, env_values, key, default):
+    if explicit is not None:
+        return int(explicit)
+    raw = env_values.get(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
 class ManagedProcess:
     def __init__(self, name, cmd, master_fd, proc):
         self.name = name
@@ -304,15 +349,36 @@ def main(args=None):
     parser = argparse.ArgumentParser(description="Confluence Orchestrator")
     parser.add_argument("--all", action="store_true", help="Start all services")
     parser.add_argument("--services", nargs="*", default=[], help="Services to start")
-    parser.add_argument("--firehose-args", default="", help="Args for firehose")
-    parser.add_argument("--uniform-pump-args", default="", help="Args for uniform_pump")
-    parser.add_argument("--inject-args", default="", help="Args for inject")
-    parser.add_argument("--fault-detector-args", default="", help="Args for fault_detector")
+    parser.add_argument("--env-file", default=".drone-env", help="Path to .drone-env defaults file")
+    parser.add_argument("--firehose-args", default=None, help="Args for firehose")
+    parser.add_argument("--uniform-pump-args", default=None, help="Args for uniform_pump")
+    parser.add_argument("--inject-args", default=None, help="Args for inject")
+    parser.add_argument("--fault-detector-args", default=None, help="Args for fault_detector")
     parser.add_argument("--log-file", default="", help="Write combined output to a log file")
-    parser.add_argument("--console-host", default="0.0.0.0", help="Console bind host")
-    parser.add_argument("--console-port", type=int, default=0, help="Console TCP port (0 disables)")
+    parser.add_argument("--console-host", default=None, help="Console bind host")
+    parser.add_argument("--console-port", type=int, default=None, help="Console TCP port (0 disables)")
 
     parsed = parser.parse_args(args=args)
+    env_values = _load_env_file(parsed.env_file)
+
+    firehose_args = _env_or_default(
+        parsed.firehose_args, env_values, "CONFLUENCE_FIREHOSE_ARGS", ""
+    )
+    uniform_pump_args = _env_or_default(
+        parsed.uniform_pump_args, env_values, "CONFLUENCE_UNIFORM_PUMP_ARGS", ""
+    )
+    inject_args = _env_or_default(
+        parsed.inject_args, env_values, "CONFLUENCE_INJECT_ARGS", ""
+    )
+    fault_detector_args = _env_or_default(
+        parsed.fault_detector_args, env_values, "CONFLUENCE_FAULT_DETECTOR_ARGS", ""
+    )
+    console_host = _env_or_default(
+        parsed.console_host, env_values, "CONFLUENCE_CONSOLE_HOST", "0.0.0.0"
+    )
+    console_port = _env_int(
+        parsed.console_port, env_values, "CONFLUENCE_CONSOLE_PORT", 0
+    )
 
     services = []
     if parsed.all:
@@ -325,20 +391,20 @@ def main(args=None):
         return 1
 
     args_map = {
-        "firehose": parsed.firehose_args,
-        "uniform_pump": parsed.uniform_pump_args,
-        "inject": parsed.inject_args,
-        "fault_detector": parsed.fault_detector_args,
+        "firehose": firehose_args,
+        "uniform_pump": uniform_pump_args,
+        "inject": inject_args,
+        "fault_detector": fault_detector_args,
     }
 
     log_file = _open_log(parsed.log_file)
 
     command_queue = queue.Queue()
     console_server = None
-    if parsed.console_port:
-        console_server = ConsoleServer(parsed.console_host, parsed.console_port, command_queue)
+    if console_port:
+        console_server = ConsoleServer(console_host, console_port, command_queue)
         console_server.start()
-        _print_line(f"Console server listening on {parsed.console_host}:{parsed.console_port}")
+        _print_line(f"Console server listening on {console_host}:{console_port}")
 
     ros_node = None
     fault_pub = None

@@ -1,301 +1,198 @@
 #!/usr/bin/env python3
 """
 ROS2 Inject node.
-Listens for parameter update commands and applies them via PX4 C API or MAVLink.
+
+Single responsibility:
+- Subscribe to `px4_injector/command`
+- Apply MAVLink PARAM_SET using the same logic as `monolithic_fault`
+- Publish result on `px4_injector/status`
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import struct
-import sys
-import time
-from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_msgs.msg import String
 
-try:
-    from pymavlink import mavutil
-    MAVLINK_AVAILABLE = True
-except Exception:
-    MAVLINK_AVAILABLE = False
-
-try:
-    from confluence.px4 import PX4ParamAPI, PX4ParamType
-    PX4_C_API_AVAILABLE = True
-except Exception as exc:
-    PX4_C_API_AVAILABLE = False
-    PX4_API_ERROR = str(exc)
+from confluence.param_injection_core import (
+    ParamInjectorClient,
+    env_or_default,
+    load_env_file,
+)
 
 
-def _encode_param_value(value, param_type):
-    if param_type == mavutil.mavlink.MAV_PARAM_TYPE_REAL32:
-        return float(value)
-    if param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT32:
-        return struct.unpack("f", struct.pack("i", int(value)))[0]
-    if param_type == mavutil.mavlink.MAV_PARAM_TYPE_UINT32:
-        return struct.unpack("f", struct.pack("I", int(value)))[0]
-    if param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT16:
-        return struct.unpack("f", struct.pack("h", int(value)))[0]
-    if param_type == mavutil.mavlink.MAV_PARAM_TYPE_UINT16:
-        return struct.unpack("f", struct.pack("H", int(value)))[0]
-    if param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT8:
-        return struct.unpack("f", struct.pack("b", int(value)))[0]
-    if param_type == mavutil.mavlink.MAV_PARAM_TYPE_UINT8:
-        return struct.unpack("f", struct.pack("B", int(value)))[0]
-    raise ValueError(f'Unsupported param type {param_type}')
-
-
-def _decode_param_value(msg):
-    t = msg.param_type
-    v = msg.param_value
-    if t == mavutil.mavlink.MAV_PARAM_TYPE_REAL32:
-        return float(v)
-    if t == mavutil.mavlink.MAV_PARAM_TYPE_INT32:
-        return struct.unpack("i", struct.pack("f", v))[0]
-    if t == mavutil.mavlink.MAV_PARAM_TYPE_UINT32:
-        return struct.unpack("I", struct.pack("f", v))[0]
-    if t == mavutil.mavlink.MAV_PARAM_TYPE_INT16:
-        return struct.unpack("h", struct.pack("f", v))[0]
-    if t == mavutil.mavlink.MAV_PARAM_TYPE_UINT16:
-        return struct.unpack("H", struct.pack("f", v))[0]
-    if t == mavutil.mavlink.MAV_PARAM_TYPE_INT8:
-        return struct.unpack("b", struct.pack("f", v))[0]
-    if t == mavutil.mavlink.MAV_PARAM_TYPE_UINT8:
-        return struct.unpack("B", struct.pack("f", v))[0]
-    return None
-
-
-class PX4ConfigInjector(Node):
+class InjectNode(Node):
     def __init__(self, cli_args=None):
-        super().__init__('px4_config_injector')
+        super().__init__("px4_config_injector")
 
-        self.declare_parameter('px4_build_path', '')
-        self.declare_parameter('use_sitl', True)
-        self.declare_parameter('sitl_connection', 'udp:127.0.0.1:14550')
-        self.declare_parameter('serial_port', '/dev/ttyTHS3')
-        self.declare_parameter('serial_baud', 115200)
-        self.declare_parameter('mavlink_connection', '')
-        self.declare_parameter('command_topic', 'px4_injector/command')
-        self.declare_parameter('status_topic', 'px4_injector/status')
+        self.declare_parameter("env_file", ".drone-env")
+        self.declare_parameter("connection", "")
+        self.declare_parameter("baud", 0)
+        self.declare_parameter("mavsdk_address", "")
+        self.declare_parameter("timeout", 0.0)
+        self.declare_parameter("skip_mavsdk", True)
+        self.declare_parameter("command_topic", "px4_injector/command")
+        self.declare_parameter("status_topic", "px4_injector/status")
 
         self._apply_cli_overrides(cli_args)
+        self._client = self._build_client()
 
-        self.px4_build_path = self.get_parameter('px4_build_path').get_parameter_value().string_value
-        self.use_sitl = bool(self.get_parameter('use_sitl').value)
-        self.serial_port = self.get_parameter('serial_port').value
-        self.serial_baud = int(self.get_parameter('serial_baud').value)
-        self.command_topic = self.get_parameter('command_topic').value
-        self.status_topic = self.get_parameter('status_topic').value
-
-        if self.px4_build_path:
-            path = Path(self.px4_build_path)
-            if not path.exists():
-                self.get_logger().warning(f'PX4 build path does not exist: {path}')
-
-        self.px4_api = None
-        if PX4_C_API_AVAILABLE:
-            try:
-                self.px4_api = PX4ParamAPI()
-                self.get_logger().info('PX4 C API loaded successfully.')
-            except Exception as exc:
-                self.get_logger().warning(f'PX4 C API not available: {exc}')
-                self.px4_api = None
-        else:
-            if 'PX4_API_ERROR' in globals():
-                self.get_logger().warning(f'PX4 C API not available: {PX4_API_ERROR}')
-            else:
-                self.get_logger().warning('PX4 C API not available.')
-
-        self.mavlink_conn_string = self._resolve_mavlink_connection()
-        self.mav = None
-        if self.px4_api is None and MAVLINK_AVAILABLE:
-            try:
-                self.get_logger().info(f'Connecting MAVLink at {self.mavlink_conn_string}')
-                conn_kwargs = {}
-                if not self.use_sitl and self.serial_baud:
-                    conn_kwargs['baud'] = self.serial_baud
-                self.mav = mavutil.mavlink_connection(self.mavlink_conn_string, **conn_kwargs)
-                self.get_logger().info('Waiting for MAVLink heartbeat...')
-                self.mav.wait_heartbeat(timeout=10)
-                self.get_logger().info('MAVLink connected.')
-            except Exception as exc:
-                self.get_logger().warning(f'MAVLink connection failed: {exc}')
-                self.mav = None
-        elif self.px4_api is None:
-            self.get_logger().warning('pymavlink not available; cannot apply params.')
-
+        self.command_topic = str(self.get_parameter("command_topic").value)
+        self.status_topic = str(self.get_parameter("status_topic").value)
         self.status_pub = self.create_publisher(String, self.status_topic, 10)
         self.command_sub = self.create_subscription(
             String,
             self.command_topic,
-            self.command_callback,
+            self._command_callback,
             10,
         )
-
-        self.get_logger().info('Inject node ready. Listening for commands.')
+        self.get_logger().info("Inject node ready. Listening for commands.")
 
     def _apply_cli_overrides(self, cli_args):
         if cli_args is None:
             return
         updates = []
-        if getattr(cli_args, 'px4_build_path', None):
-            updates.append(Parameter('px4_build_path', Parameter.Type.STRING, cli_args.px4_build_path))
-        if getattr(cli_args, 'sitl', None) is True:
-            updates.append(Parameter('use_sitl', Parameter.Type.BOOL, True))
-        if getattr(cli_args, 'sitl_connection', None):
-            updates.append(Parameter('sitl_connection', Parameter.Type.STRING, cli_args.sitl_connection))
-        if getattr(cli_args, 'serial_port', None):
-            updates.append(Parameter('serial_port', Parameter.Type.STRING, cli_args.serial_port))
-        if getattr(cli_args, 'serial_baud', None):
-            updates.append(Parameter('serial_baud', Parameter.Type.INTEGER, cli_args.serial_baud))
-        if getattr(cli_args, 'connection', None):
-            updates.append(Parameter('mavlink_connection', Parameter.Type.STRING, cli_args.connection))
+        if cli_args.env_file:
+            updates.append(
+                Parameter("env_file", Parameter.Type.STRING, cli_args.env_file)
+            )
+        if cli_args.connection:
+            updates.append(
+                Parameter("connection", Parameter.Type.STRING, cli_args.connection)
+            )
+        if cli_args.baud is not None:
+            updates.append(Parameter("baud", Parameter.Type.INTEGER, int(cli_args.baud)))
+        if cli_args.mavsdk_address:
+            updates.append(
+                Parameter(
+                    "mavsdk_address",
+                    Parameter.Type.STRING,
+                    cli_args.mavsdk_address,
+                )
+            )
+        if cli_args.timeout is not None:
+            updates.append(Parameter("timeout", Parameter.Type.DOUBLE, float(cli_args.timeout)))
+        if cli_args.skip_mavsdk:
+            updates.append(Parameter("skip_mavsdk", Parameter.Type.BOOL, True))
         if updates:
             self.set_parameters(updates)
 
-    def _resolve_mavlink_connection(self):
-        explicit = self.get_parameter('mavlink_connection').get_parameter_value().string_value
-        sitl_conn = self.get_parameter('sitl_connection').get_parameter_value().string_value
-        if explicit:
-            return explicit
-        if self.use_sitl:
-            return sitl_conn
-        return self.serial_port
+    def _build_client(self) -> ParamInjectorClient:
+        env_file = str(self.get_parameter("env_file").value)
+        env_values = load_env_file(env_file)
 
-    def command_callback(self, msg: String):
-        self.get_logger().info(f'Received command: {msg.data}')
+        connection_raw = str(self.get_parameter("connection").value).strip()
+        baud_raw = int(self.get_parameter("baud").value)
+        mavsdk_raw = str(self.get_parameter("mavsdk_address").value).strip()
+        timeout_raw = float(self.get_parameter("timeout").value)
+        skip_mavsdk = bool(self.get_parameter("skip_mavsdk").value)
+
+        connection = env_or_default(
+            connection_raw if connection_raw else None,
+            env_values,
+            "CONFLUENCE_MAVLINK_CONNECTION",
+            "/dev/ttyTHS3",
+            str,
+        )
+        baud = env_or_default(
+            baud_raw if baud_raw > 0 else None,
+            env_values,
+            "CONFLUENCE_MAVLINK_BAUD",
+            115200,
+            int,
+        )
+        mavsdk_address = env_or_default(
+            mavsdk_raw if mavsdk_raw else None,
+            env_values,
+            "CONFLUENCE_MAVSDK_ADDRESS",
+            f"serial://{connection}:{baud}",
+            str,
+        )
+        timeout = env_or_default(
+            timeout_raw if timeout_raw > 0 else None,
+            env_values,
+            "CONFLUENCE_PARAM_TIMEOUT",
+            5.0,
+            float,
+        )
+
+        self.get_logger().info(
+            f"Inject config connection={connection} baud={baud} mavsdk={mavsdk_address}"
+        )
+        return ParamInjectorClient(
+            connection=connection,
+            baud=baud,
+            mavsdk_address=mavsdk_address,
+            timeout_sec=timeout,
+            enable_mavsdk_warmup=not skip_mavsdk,
+        )
+
+    def _command_callback(self, msg: String):
         try:
             command = json.loads(msg.data)
-        except json.JSONDecodeError:
-            self.get_logger().error('Command must be JSON.')
+        except Exception:
+            self.get_logger().error("Command must be JSON")
             return
 
-        action = command.get('action', 'set_params')
-        if action != 'set_params':
-            self.get_logger().warning(f'Unknown action: {action}')
+        if command.get("action", "set_params") != "set_params":
+            self.get_logger().warning(f"Unsupported action: {command.get('action')}")
             return
 
-        params = command.get('params')
+        params = command.get("params")
         if not isinstance(params, dict):
-            single = command.get('param')
-            value = command.get('value')
+            single = command.get("param")
             if single is None:
-                self.get_logger().error('No params provided in command.')
+                self.get_logger().warning("No params supplied")
                 return
-            params = {single: value}
+            params = {single: command.get("value")}
 
-        results = {}
-        for name, value in params.items():
-            ok = self._set_param(name, value)
-            results[name] = ok
+        results: dict[str, bool] = {}
+        details: dict[str, dict[str, object]] = {}
+        for param_name, param_value in params.items():
+            ok, actual, reason = self._client.set_and_verify(param_name, param_value)
+            results[param_name] = bool(ok)
+            detail: dict[str, object] = {"ok": bool(ok), "actual": actual}
+            if reason is not None:
+                detail["reason"] = reason
+            details[param_name] = detail
 
-        status = {
-            'action': 'set_params',
-            'results': results,
+        status_payload = {
+            "action": "set_params",
+            "results": results,
+            "details": details,
+            "source": "inject",
         }
         status_msg = String()
-        status_msg.data = json.dumps(status)
+        status_msg.data = json.dumps(status_payload)
         self.status_pub.publish(status_msg)
 
-    def _set_param(self, name, value):
-        if self.px4_api is not None:
-            try:
-                if isinstance(value, bool):
-                    value = int(value)
-                ok = self.px4_api.set_param(name, value)
-                if not ok:
-                    self.get_logger().warning(f'PX4 C API failed to set {name}')
-                return ok
-            except Exception as exc:
-                self.get_logger().warning(f'PX4 C API error for {name}: {exc}')
-
-        if self.mav is None:
-            self.get_logger().warning(f'No MAVLink connection for {name}')
-            return False
-
+    def destroy_node(self):
         try:
-            if isinstance(value, bool):
-                value = int(value)
-            if isinstance(value, int):
-                param_type = mavutil.mavlink.MAV_PARAM_TYPE_INT32
-            else:
-                param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
-            encoded = _encode_param_value(value, param_type)
-            self.mav.mav.param_set_send(
-                self.mav.target_system,
-                mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1,
-                name.encode('utf-8'),
-                encoded,
-                param_type,
-            )
-            return self._verify_param(name, value)
-        except Exception as exc:
-            self.get_logger().warning(f'Failed MAVLink param set for {name}: {exc}')
-            return False
-
-    def _verify_param(self, name, expected, timeout_sec=1.5):
-        """Request and verify parameter value from PX4 after write."""
-        if self.mav is None:
-            return False
-        try:
-            self.mav.mav.param_request_read_send(
-                self.mav.target_system,
-                self.mav.target_component,
-                name.encode('utf-8'),
-                -1,
-            )
-        except Exception as exc:
-            self.get_logger().warning(f'Failed to request param readback for {name}: {exc}')
-            return False
-
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            msg = self.mav.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.2)
-            if msg is None:
-                continue
-            param_id = msg.param_id
-            if isinstance(param_id, bytes):
-                param_id = param_id.decode('utf-8', errors='ignore')
-            param_id = str(param_id).rstrip('\x00')
-            if param_id != name:
-                continue
-            actual = _decode_param_value(msg)
-            try:
-                if isinstance(expected, float):
-                    ok = abs(float(actual) - float(expected)) < 1e-4
-                else:
-                    ok = int(actual) == int(expected)
-            except Exception:
-                ok = False
-            if not ok:
-                self.get_logger().warning(
-                    f'Param verify mismatch for {name}: expected={expected} actual={actual}'
-                )
-            else:
-                self.get_logger().info(f'Param verified: {name}={actual}')
-            return ok
-        self.get_logger().warning(f'No PARAM_VALUE readback for {name}')
-        return False
+            self._client.close()
+        except Exception:
+            pass
+        super().destroy_node()
 
 
 def _parse_cli_args(argv):
-    parser = argparse.ArgumentParser(add_help=False, description='Inject helpers')
-    parser.add_argument('--px4-build-path', dest='px4_build_path', help='PX4 build directory')
-    parser.add_argument('--sitl', action='store_true', help='Force SITL connection.')
-    parser.add_argument('--sitl-connection', dest='sitl_connection', help='SITL connection string.')
-    parser.add_argument('--serial-port', dest='serial_port', help='Serial port path for hardware connection.')
-    parser.add_argument('--serial-baud', dest='serial_baud', type=int, help='Serial baud rate for hardware connection.')
-    parser.add_argument('--connection', dest='connection', help='Override MAVLink connection string.')
+    parser = argparse.ArgumentParser(add_help=False, description="Inject connection helpers")
+    parser.add_argument("--env-file", dest="env_file", help="Path to .drone-env file")
+    parser.add_argument("--connection", dest="connection", help="MAVLink connection string")
+    parser.add_argument("--baud", dest="baud", type=int, help="Serial baud")
+    parser.add_argument("--mavsdk-address", dest="mavsdk_address", help="MAVSDK warmup address")
+    parser.add_argument("--timeout", dest="timeout", type=float, help="Timeout in seconds")
+    parser.add_argument("--skip-mavsdk", dest="skip_mavsdk", action="store_true", help="Skip MAVSDK warmup")
     return parser.parse_known_args(argv)
 
 
 def main(args=None):
-    overrides, remaining = _parse_cli_args(args if args is not None else None)
-    rclpy.init(args=remaining)
-    node = PX4ConfigInjector(cli_args=overrides)
+    cli_args, ros_args = _parse_cli_args(args if args is not None else None)
+    rclpy.init(args=ros_args)
+    node = InjectNode(cli_args=cli_args)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -305,5 +202,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

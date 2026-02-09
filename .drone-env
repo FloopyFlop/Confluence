@@ -1,0 +1,23 @@
+# Confluence drone runtime defaults.
+# These values are consumed automatically by:
+# - ros2 run confluence monolithic_fault
+# - ros2 run confluence inject
+# - ros2 run confluence inject_param
+# - ros2 run confluence orchestrator
+
+CONFLUENCE_MAVLINK_CONNECTION=/dev/ttyTHS3
+CONFLUENCE_MAVLINK_BAUD=115200
+CONFLUENCE_MAVSDK_ADDRESS=serial:///dev/ttyTHS3:115200
+CONFLUENCE_PARAM_TIMEOUT=5.0
+
+# Default one-shot fault injection payload.
+CONFLUENCE_FAULT_PARAM=PWM_MAIN_FUNC3
+CONFLUENCE_FAULT_VALUE=0
+
+# Orchestrator defaults.
+CONFLUENCE_FIREHOSE_ARGS="--serial-port /dev/ttyTHS3 --serial-baud 115200"
+CONFLUENCE_UNIFORM_PUMP_ARGS=""
+CONFLUENCE_INJECT_ARGS=""
+CONFLUENCE_FAULT_DETECTOR_ARGS=""
+CONFLUENCE_CONSOLE_HOST=0.0.0.0
+CONFLUENCE_CONSOLE_PORT=9000

@@ -36,8 +36,8 @@ class UniformPumpNode(Node):
     def __init__(self):
         super().__init__('uniform_pump_node')
 
-        self.declare_parameter('batch_interval', 1.0)
-        self.declare_parameter('condensation_mode', 'raw')
+        self.declare_parameter('batch_interval', 0.2)
+        self.declare_parameter('condensation_mode', 'multi_step')
         self.declare_parameter('multi_step_count', 3)
         self.declare_parameter('bleeding_domain_duration', 15.0)
         self.declare_parameter('missing_data_strategy', 'bleeding_average')

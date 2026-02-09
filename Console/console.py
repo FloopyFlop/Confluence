@@ -39,10 +39,25 @@ def _print(line):
     sys.stdout.flush()
 
 
+def _print_help():
+    _print("Commands:")
+    _print("  list")
+    _print("  fault <index>")
+    _print("  clear")
+    _print("  inject PARAM=VALUE ...")
+    _print("  watch <topic> <type>")
+    _print("  unwatch <topic>")
+    _print("  pub <topic> <type> <json>")
+    _print("  send {json}")
+    _print("  quit")
+
+
 def _parse_command(line):
     line = line.strip()
     if not line:
         return None
+    if line == "help":
+        return {"cmd": "help"}
     if line.startswith("send "):
         raw = line[len("send "):].strip()
         try:
@@ -142,7 +157,7 @@ def main():
     reader_thread = threading.Thread(target=_reader, args=(sock,), daemon=True)
     reader_thread.start()
 
-    _print("Connected. Type 'list', 'fault 1', 'clear', 'inject PARAM=VALUE', 'watch <topic> <type>', 'pub <topic> <type> <json>', or 'quit'.")
+    _print("Connected. Type 'help' for commands.")
     while True:
         try:
             line = input("console> ")
@@ -150,6 +165,9 @@ def main():
             break
         cmd = _parse_command(line)
         if not cmd:
+            continue
+        if cmd.get("cmd") == "help":
+            _print_help()
             continue
         if cmd.get("cmd") == "quit":
             break
