@@ -30,6 +30,7 @@ ROS2 microservices for the Waterfall stack, rebuilt to use ROS2 pub/sub while pr
 ## Build
 ```bash
 cd /path/to/your/ros2_ws
+rosdep install --from-paths src -y --ignore-src
 colcon build --symlink-install --packages-select confluence
 source install/setup.bash
 ```
@@ -49,6 +50,9 @@ ros2 run confluence fault_detector --ros-args -p model_path:=/path/to/model.ckpt
 # Inject (hardware serial)
 ros2 run confluence inject --serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p use_sitl:=false
 ```
+Note: Firehose and Inject cannot share the same serial device at the same time. If you need both
+on hardware, use a MAVLink router or a UDP connection for Inject (e.g. via mavlink-router or PX4
+telemetry over UDP) so only Firehose owns `/dev/ttyTHS3`.
 
 SITL (optional, retained for debugging):
 ```bash
@@ -63,7 +67,13 @@ ros2 run confluence inject --ros-args -p use_sitl:=true
 # Start all services (hardware serial)
 ros2 run confluence orchestrator --all \
   --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200" \
-  --inject-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p use_sitl:=false"
+  --uniform-pump-args "--ros-args -p condensation_mode:=multi_step -p multi_step_count:=3"
+
+# Start all services with inject over UDP (requires MAVLink routing to this UDP port)
+ros2 run confluence orchestrator --all \
+  --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p enable_command_bridge:=false" \
+  --uniform-pump-args "--ros-args -p condensation_mode:=multi_step -p multi_step_count:=3" \
+  --inject-args "--connection udp:127.0.0.1:14560 --ros-args -p use_sitl:=false"
 
 # Start a subset
 ros2 run confluence orchestrator --services firehose uniform_pump fault_detector
@@ -76,7 +86,18 @@ ros2 run confluence orchestrator --all \
 
 # Combined output log
 ros2 run confluence orchestrator --all --log-file /tmp/confluence_run.txt
+
+# With console enabled (see next section for remote console access)
+ros2 run confluence orchestrator --all \
+  --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p enable_command_bridge:=false" \
+  --uniform-pump-args "--ros-args -p condensation_mode:=multi_step -p multi_step_count:=3" \
+  --inject-args "--connection udp:127.0.0.1:14560 --ros-args -p use_sitl:=false" \
+  --console-host 0.0.0.0 --console-port 9000
+
+# Run console
+uv run Console/console.py --host 10.48.134.181 --port 9000
 ```
+If you do not have MAVLink routed to UDP for `inject`, run the subset command above and omit `inject`.
 
 Orchestrator interactive commands:
 - `list`
@@ -84,6 +105,7 @@ Orchestrator interactive commands:
 - `attach <name>`
 - `help`
 - `quit`
+Note: `watch`, `fault`, `clear`, `inject` are Console commands, not orchestrator shell commands.
 
 While attached: press `Ctrl-]` to detach, `Ctrl-C` to stop all services.
 
@@ -91,8 +113,9 @@ While attached: press `Ctrl-]` to detach, `Ctrl-C` to stop all services.
 Run the orchestrator on the drone with the console port enabled:
 ```bash
 ros2 run confluence orchestrator --all \
-  --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200" \
-  --inject-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p use_sitl:=false" \
+  --firehose-args "--serial-port /dev/ttyTHS3 --serial-baud 115200 --ros-args -p enable_command_bridge:=false" \
+  --uniform-pump-args "--ros-args -p condensation_mode:=multi_step -p multi_step_count:=3" \
+  --inject-args "--connection udp:127.0.0.1:14560 --ros-args -p use_sitl:=false" \
   --console-host 0.0.0.0 --console-port 9000
 ```
 
@@ -104,13 +127,22 @@ python3 Console/console.py --host <DRONE_IP> --port 9000
 Console commands:
 - `list`
 - `fault <1-4>` (force a fault output for demo)
-- `clear` (clear forced fault)
+- `clear` (clear forced fault and resume model inference)
 - `inject PARAM=VALUE ...` (send parameter updates to `inject`)
 - `watch <topic> <type>` (stream a ROS2 topic, e.g. `mav/uniform_batch std_msgs/msg/String`)
 - `unwatch <topic>`
 - `pub <topic> <type> <json>` (publish to a ROS2 topic)
 - `send {json}` (send raw JSON to orchestrator console)
 - `quit`
+To verify inject writes from Console:
+- `watch px4_injector/status std_msgs/msg/String` and check `results` for `true/false`.
+- Check `details` for each param (`actual`, `reason`) to confirm readback verification.
+
+One-shot verification hook (on the ROS machine):
+```bash
+ros2 run confluence verify_injection --param PWM_MAIN_FUNC4 --value 101 --timeout 5
+```
+Exit code `0` means verified readback, `1` means failed/timeout.
 
 Example console session:
 ```bash
@@ -123,6 +155,11 @@ pub fault_detector/command std_msgs/msg/String {"data":"{\"action\":\"inject_fau
 clear
 quit
 ```
+Behavior note:
+- `fault <n>` now latches a forced fault and pauses model inference until `clear`.
+- Output messages include `source: "forced"` or `source: "model"` to distinguish origin.
+- Forced faults (`fault <n>`) publish to `fault_detector/output` and also send parameter updates to `inject` by default when `inject` is running.
+- Model-driven injection is gated by `publish_inject_command` (default `false`).
 
 ## Hooks (one-off commands)
 Hooks are small scripts for quick, single-purpose commands. They talk to the orchestrator console.
@@ -153,9 +190,17 @@ ros2 topic pub /px4_injector/command std_msgs/String "{data: '{\"action\": \"set
   "fault": true,
   "fault_label": "motor 2 malfunction",
   "parameters": {"PWM_MAIN_FUNC1": 102},
-  "timestamp": 1710000000.0
+  "timestamp": 1710000000.0,
+  "source": "model"
 }
 ```
+Important:
+- A forced fault event is a software signal; it does not physically stop a motor by itself.
+- Physical effect depends on `inject` being connected and on whether the target PX4 parameter applies immediately for your airframe/output mapping.
+- In the original `waterfall_local` flow, parameter reconfiguration happened after flight; on many PX4 setups, `PWM_MAIN_FUNC*` updates are only fully realized after disarm/re-arm (or reboot).
+- For dry-run forced faults without writing params, use:
+  `send {"cmd":"fault","fault_index":1,"apply_inject":false}`
+- `px4_injector/command` can be handled by `firehose` (direct serial path) or `inject` service (separate MAVLink link). Do not leave both enabled unless you want duplicate writes.
 
 ## Torch on Jetson
 The default `pip install torch` wheel is not compatible with Jetson. We need to use the NVIDIA Jetson PyTorch build.

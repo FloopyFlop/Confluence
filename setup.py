@@ -36,6 +36,8 @@ setup(
             'inject = confluence.inject:main',
             'fault_detector = confluence.fault_detector:main',
             'orchestrator = confluence.orchestrator:main',
+            'verify_injection = confluence.hooks.verify_injection:main',
+            'monolithic_fault = confluence.monolithic_fault:main',
         ],
     },
 )

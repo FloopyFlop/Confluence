@@ -33,9 +33,11 @@ class FaultDetectorNode(Node):
         self.declare_parameter('model_path', 'models/classifier_3ts.ckpt')
         self.declare_parameter('input_topic', 'mav/uniform_batch')
         self.declare_parameter('output_topic', 'fault_detector/output')
+        # Controls model-driven auto injection. Forced console faults can still inject.
         self.declare_parameter('publish_inject_command', False)
         self.declare_parameter('inject_topic', 'px4_injector/command')
         self.declare_parameter('command_topic', 'fault_detector/command')
+        self.declare_parameter('pause_inference_on_forced_fault', True)
 
         self.model_path = str(self.get_parameter('model_path').value)
         self.input_topic = self.get_parameter('input_topic').value
@@ -43,6 +45,11 @@ class FaultDetectorNode(Node):
         self.inject_topic = self.get_parameter('inject_topic').value
         self.publish_inject_command = bool(self.get_parameter('publish_inject_command').value)
         self.command_topic = self.get_parameter('command_topic').value
+        self.pause_inference_on_forced_fault = bool(
+            self.get_parameter('pause_inference_on_forced_fault').value
+        )
+        self._last_vector_warn = 0.0
+        self._forced_fault_active = False
 
         self._configure_model_spec()
         self.model = self._load_model()
@@ -60,9 +67,8 @@ class FaultDetectorNode(Node):
             10,
         )
         self.result_pub = self.create_publisher(String, self.output_topic, 10)
-        self.inject_pub = None
-        if self.publish_inject_command:
-            self.inject_pub = self.create_publisher(String, self.inject_topic, 10)
+        # Always create inject publisher so forced fault commands can optionally apply params.
+        self.inject_pub = self.create_publisher(String, self.inject_topic, 10)
 
         self.get_logger().info('Fault Detector started')
 
@@ -114,6 +120,8 @@ class FaultDetectorNode(Node):
     def _batch_callback(self, msg: String):
         if self.model is None:
             return
+        if self._forced_fault_active and self.pause_inference_on_forced_fault:
+            return
 
         try:
             batch = json.loads(msg.data)
@@ -150,12 +158,14 @@ class FaultDetectorNode(Node):
             'fault_label': label or 'nominal',
             'parameters': param_fix or {},
             'timestamp': time.time(),
+            'source': 'model',
         }
         out_msg = String()
         out_msg.data = json.dumps(result)
         self.result_pub.publish(out_msg)
 
-        if fault and self.inject_pub is not None:
+        # Model-driven injection is optional and gated by publish_inject_command.
+        if fault and self.publish_inject_command and self.inject_pub is not None:
             inject_cmd = {
                 'action': 'set_params',
                 'params': param_fix,
@@ -194,28 +204,33 @@ class FaultDetectorNode(Node):
             else:
                 self.get_logger().warning('Fault command missing fault_index or fault_label/params')
                 return
-            self._publish_fault(True, fault_label, params)
+            self._forced_fault_active = True
+            apply_inject = bool(command.get('apply_inject', True))
+            self._publish_fault(True, fault_label, params, apply_inject=apply_inject)
             return
 
         if action in ('clear_fault', 'clear'):
-            self._publish_fault(False, 'nominal', {})
+            self._forced_fault_active = False
+            self._publish_fault(False, 'nominal', {}, apply_inject=False)
             return
 
         self.get_logger().warning(f'Unknown fault command: {action}')
 
-    def _publish_fault(self, fault, label, params):
+    def _publish_fault(self, fault, label, params, apply_inject=True):
         result = {
             'fault': bool(fault),
             'fault_label': label or 'nominal',
             'parameters': params or {},
             'timestamp': time.time(),
             'forced': True,
+            'source': 'forced',
+            'apply_inject': bool(apply_inject),
         }
         out_msg = String()
         out_msg.data = json.dumps(result)
         self.result_pub.publish(out_msg)
 
-        if fault and self.inject_pub is not None and params:
+        if fault and apply_inject and self.inject_pub is not None and params:
             inject_cmd = {
                 'action': 'set_params',
                 'params': params,
@@ -255,23 +270,43 @@ class FaultDetectorNode(Node):
                 if isinstance(v, dict):
                     values.extend(self.flatten_entry(v))
                 elif isinstance(v, (list, tuple)):
-                    values.extend(v)
+                    values.extend(self.flatten_entry(v))
                 else:
-                    values.append(v)
+                    num = self._coerce_float(v)
+                    if num is not None:
+                        values.append(num)
         elif isinstance(entry, (list, tuple)):
-            values.extend(entry)
+            for v in entry:
+                num = self._coerce_float(v)
+                if num is not None:
+                    values.append(num)
         elif entry is None:
             values.append(0.0)
         else:
-            values.append(entry)
+            num = self._coerce_float(entry)
+            if num is not None:
+                values.append(num)
 
         if norm is None:
             return values
         lo, hi, count = norm
         normalized = []
         for v in values[:count]:
-            normalized.append((v - lo) / (hi - lo))
+            try:
+                normalized.append((float(v) - lo) / (hi - lo))
+            except Exception:
+                normalized.append(0.0)
         return normalized
+
+    def _coerce_float(self, value):
+        if isinstance(value, bool):
+            return float(int(value))
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(value)
+        except Exception:
+            return None
 
     def _select_entry(self, data, index):
         if data is None:
@@ -289,6 +324,72 @@ class FaultDetectorNode(Node):
             return entry
         return data
 
+    def _float_or_zero(self, value):
+        num = self._coerce_float(value)
+        if num is None:
+            return 0.0
+        return num
+
+    def _normalize_list(self, values, low, high, count):
+        out = []
+        span = high - low
+        if span == 0:
+            span = 1.0
+        for idx in range(count):
+            if idx < len(values):
+                v = self._float_or_zero(values[idx])
+                out.append((v - low) / span)
+            else:
+                out.append(0.0)
+        return out
+
+    def _extract_attitude(self, entry):
+        if not isinstance(entry, dict):
+            return [0.0] * 6
+        return [
+            self._float_or_zero(entry.get('roll')),
+            self._float_or_zero(entry.get('pitch')),
+            self._float_or_zero(entry.get('yaw')),
+            self._float_or_zero(entry.get('rollspeed')),
+            self._float_or_zero(entry.get('pitchspeed')),
+            self._float_or_zero(entry.get('yawspeed')),
+        ]
+
+    def _extract_quat(self, entry):
+        # waterfall_local shape
+        if isinstance(entry, dict) and 'pose' in entry:
+            orient = entry.get('pose', {}).get('orientation', {})
+            return [
+                self._float_or_zero(orient.get('w')),
+                self._float_or_zero(orient.get('x')),
+                self._float_or_zero(orient.get('y')),
+                self._float_or_zero(orient.get('z')),
+            ]
+        # MAVLink raw ATTITUDE_QUATERNION shape
+        if isinstance(entry, dict):
+            return [
+                self._float_or_zero(entry.get('q1')),
+                self._float_or_zero(entry.get('q2')),
+                self._float_or_zero(entry.get('q3')),
+                self._float_or_zero(entry.get('q4')),
+            ]
+        return [0.0] * 4
+
+    def _extract_channels(self, entry, key_prefix):
+        if isinstance(entry, dict):
+            # waterfall_local shape
+            if 'channels' in entry and isinstance(entry['channels'], (list, tuple)):
+                raw = [self._float_or_zero(v) for v in entry['channels']]
+                return raw[:8]
+            # MAVLink raw shape (chan1_raw.. / servo1_raw..)
+            vals = []
+            for i in range(1, 9):
+                vals.append(self._float_or_zero(entry.get(f'{key_prefix}{i}_raw')))
+            return vals
+        if isinstance(entry, (list, tuple)):
+            return [self._float_or_zero(v) for v in entry[:8]]
+        return [0.0] * 8
+
     def compile_feature_vector(self, data, data_labels, idxs):
         feature_vector = []
 
@@ -302,25 +403,46 @@ class FaultDetectorNode(Node):
 
         for i in idxs:
             temp_vector = []
-            for label in data_labels:
-                if 'time' in label:
-                    entry = data.get(label, [])
-                    flattened = self.flatten_entry(entry)
-                    if start_timestamp is not None:
-                        flattened = [t - start_timestamp for t in flattened]
-                    temp_vector.extend(flattened)
-                else:
-                    entry = self._select_entry(data.get(label), i)
-                    if 'quat' in label:
-                        if isinstance(entry, dict) and 'pose' in entry:
-                            entry = entry['pose'].get('orientation', entry)
-                    if 'rc' in label:
-                        temp_vector.extend(self.flatten_entry(entry, norm=(1000, 2400, 8)))
-                    elif 'servo' in label:
-                        temp_vector.extend(self.flatten_entry(entry, norm=(0, 1000, 8)))
+            # Fixed schema to match training pipeline:
+            # attitude(6) + quat(4) + rc(8) + servo(8) + timestamp(1 optional)
+            attitude = self._select_entry(data.get('attitude'), i)
+            temp_vector.extend(self._extract_attitude(attitude))
+
+            quat = self._select_entry(data.get('attitude_quat'), i)
+            temp_vector.extend(self._extract_quat(quat))
+
+            rc = self._select_entry(data.get('rc_channels'), i)
+            temp_vector.extend(self._normalize_list(self._extract_channels(rc, 'chan'), 1000.0, 2400.0, 8))
+
+            servo = self._select_entry(data.get('servo_output'), i)
+            temp_vector.extend(self._normalize_list(self._extract_channels(servo, 'servo'), 0.0, 1000.0, 8))
+
+            if 'timestamps' in data_labels:
+                ts_val = 0.0
+                if isinstance(timestamps, list) and timestamps:
+                    if i < len(timestamps):
+                        ts_val = self._float_or_zero(timestamps[i])
                     else:
-                        temp_vector.extend(self.flatten_entry(entry))
+                        ts_val = self._float_or_zero(timestamps[-1])
+                start_num = self._coerce_float(start_timestamp)
+                if start_num is not None:
+                    ts_val = ts_val - start_num
+                temp_vector.append(ts_val)
             feature_vector.extend(temp_vector)
+
+        # Ensure vector length matches model input
+        if len(feature_vector) != self.input_layer:
+            now = time.time()
+            if now - self._last_vector_warn > 5.0:
+                self.get_logger().warning(
+                    f'Feature vector length {len(feature_vector)} does not match expected {self.input_layer}. '
+                    'Padding/truncating to fit.'
+                )
+                self._last_vector_warn = now
+            if len(feature_vector) < self.input_layer:
+                feature_vector.extend([0.0] * (self.input_layer - len(feature_vector)))
+            else:
+                feature_vector = feature_vector[: self.input_layer]
 
         return np.array(feature_vector, dtype=float)
 

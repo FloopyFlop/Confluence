@@ -142,7 +142,7 @@ def main():
     reader_thread = threading.Thread(target=_reader, args=(sock,), daemon=True)
     reader_thread.start()
 
-    _print("Connected. Type 'list', 'fault 1', 'clear', 'inject PARAM=VALUE', or 'quit'.")
+    _print("Connected. Type 'list', 'fault 1', 'clear', 'inject PARAM=VALUE', 'watch <topic> <type>', 'pub <topic> <type> <json>', or 'quit'.")
     while True:
         try:
             line = input("console> ")

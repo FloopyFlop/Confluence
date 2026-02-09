@@ -6,7 +6,9 @@ Listens for parameter update commands and applies them via PX4 C API or MAVLink.
 
 import argparse
 import json
+import struct
 import sys
+import time
 from pathlib import Path
 
 import rclpy
@@ -32,18 +34,38 @@ def _encode_param_value(value, param_type):
     if param_type == mavutil.mavlink.MAV_PARAM_TYPE_REAL32:
         return float(value)
     if param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT32:
-        return float(int(value))
+        return struct.unpack("f", struct.pack("i", int(value)))[0]
     if param_type == mavutil.mavlink.MAV_PARAM_TYPE_UINT32:
-        return float(int(value))
+        return struct.unpack("f", struct.pack("I", int(value)))[0]
     if param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT16:
-        return float(int(value))
+        return struct.unpack("f", struct.pack("h", int(value)))[0]
     if param_type == mavutil.mavlink.MAV_PARAM_TYPE_UINT16:
-        return float(int(value))
+        return struct.unpack("f", struct.pack("H", int(value)))[0]
     if param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT8:
-        return float(int(value))
+        return struct.unpack("f", struct.pack("b", int(value)))[0]
     if param_type == mavutil.mavlink.MAV_PARAM_TYPE_UINT8:
-        return float(int(value))
+        return struct.unpack("f", struct.pack("B", int(value)))[0]
     raise ValueError(f'Unsupported param type {param_type}')
+
+
+def _decode_param_value(msg):
+    t = msg.param_type
+    v = msg.param_value
+    if t == mavutil.mavlink.MAV_PARAM_TYPE_REAL32:
+        return float(v)
+    if t == mavutil.mavlink.MAV_PARAM_TYPE_INT32:
+        return struct.unpack("i", struct.pack("f", v))[0]
+    if t == mavutil.mavlink.MAV_PARAM_TYPE_UINT32:
+        return struct.unpack("I", struct.pack("f", v))[0]
+    if t == mavutil.mavlink.MAV_PARAM_TYPE_INT16:
+        return struct.unpack("h", struct.pack("f", v))[0]
+    if t == mavutil.mavlink.MAV_PARAM_TYPE_UINT16:
+        return struct.unpack("H", struct.pack("f", v))[0]
+    if t == mavutil.mavlink.MAV_PARAM_TYPE_INT8:
+        return struct.unpack("b", struct.pack("f", v))[0]
+    if t == mavutil.mavlink.MAV_PARAM_TYPE_UINT8:
+        return struct.unpack("B", struct.pack("f", v))[0]
+    return None
 
 
 class PX4ConfigInjector(Node):
@@ -204,15 +226,59 @@ class PX4ConfigInjector(Node):
             encoded = _encode_param_value(value, param_type)
             self.mav.mav.param_set_send(
                 self.mav.target_system,
-                self.mav.target_component,
+                mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1,
                 name.encode('utf-8'),
                 encoded,
                 param_type,
             )
-            return True
+            return self._verify_param(name, value)
         except Exception as exc:
             self.get_logger().warning(f'Failed MAVLink param set for {name}: {exc}')
             return False
+
+    def _verify_param(self, name, expected, timeout_sec=1.5):
+        """Request and verify parameter value from PX4 after write."""
+        if self.mav is None:
+            return False
+        try:
+            self.mav.mav.param_request_read_send(
+                self.mav.target_system,
+                self.mav.target_component,
+                name.encode('utf-8'),
+                -1,
+            )
+        except Exception as exc:
+            self.get_logger().warning(f'Failed to request param readback for {name}: {exc}')
+            return False
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            msg = self.mav.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.2)
+            if msg is None:
+                continue
+            param_id = msg.param_id
+            if isinstance(param_id, bytes):
+                param_id = param_id.decode('utf-8', errors='ignore')
+            param_id = str(param_id).rstrip('\x00')
+            if param_id != name:
+                continue
+            actual = _decode_param_value(msg)
+            try:
+                if isinstance(expected, float):
+                    ok = abs(float(actual) - float(expected)) < 1e-4
+                else:
+                    ok = int(actual) == int(expected)
+            except Exception:
+                ok = False
+            if not ok:
+                self.get_logger().warning(
+                    f'Param verify mismatch for {name}: expected={expected} actual={actual}'
+                )
+            else:
+                self.get_logger().info(f'Param verified: {name}={actual}')
+            return ok
+        self.get_logger().warning(f'No PARAM_VALUE readback for {name}')
+        return False
 
 
 def _parse_cli_args(argv):

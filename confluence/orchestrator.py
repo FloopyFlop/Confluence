@@ -522,6 +522,8 @@ def main(args=None):
                 msg["fault_label"] = payload["fault_label"]
             if "params" in payload:
                 msg["params"] = payload["params"]
+            if "apply_inject" in payload:
+                msg["apply_inject"] = bool(payload["apply_inject"])
             ros_msg = String()
             ros_msg.data = json.dumps(msg)
             fault_pub.publish(ros_msg)
