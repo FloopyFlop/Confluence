@@ -144,7 +144,6 @@ class ParamInjectorClient:
         try:
             asyncio.run(_run())
         except Exception:
-            # Warmup is best-effort; pymavlink is authoritative path.
             pass
 
     def connect(self) -> None:

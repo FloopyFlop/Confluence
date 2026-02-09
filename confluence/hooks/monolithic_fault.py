@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 
-from confluence.param_injection_core import ParamInjectorClient, env_or_default, load_env_file
+from confluence.utils.param_injection import ParamInjectorClient, env_or_default, load_env_file
 
 
 def parse_args() -> argparse.Namespace:

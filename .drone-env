@@ -2,7 +2,6 @@
 # These values are consumed automatically by:
 # - ros2 run confluence monolithic_fault
 # - ros2 run confluence inject
-# - ros2 run confluence inject_param
 # - ros2 run confluence orchestrator
 
 CONFLUENCE_MAVLINK_CONNECTION=/dev/ttyTHS3

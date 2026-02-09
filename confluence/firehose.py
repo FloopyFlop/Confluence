@@ -16,6 +16,12 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_msgs.msg import String, UInt8MultiArray
 
+from confluence.utils.param_injection import (
+    decode_param_value,
+    encode_param_value,
+    normalize_param_id,
+)
+
 try:
     from pymavlink import mavutil
 
@@ -47,6 +53,8 @@ class MavFirehoseNode(Node):
         self.declare_parameter("publish_raw_bytes", False)
         self.declare_parameter("topic_all_messages", "mav/all_messages")
         self.declare_parameter("topic_raw_bytes", "mav/raw/bytes")
+        self.declare_parameter("inject_command_topic", "px4_injector/command")
+        self.declare_parameter("inject_status_topic", "px4_injector/status")
 
         self._apply_cli_overrides(cli_overrides)
 
@@ -73,11 +81,20 @@ class MavFirehoseNode(Node):
 
         self.topic_all_messages = str(self.get_parameter("topic_all_messages").value)
         self.topic_raw_bytes = str(self.get_parameter("topic_raw_bytes").value)
+        self.inject_command_topic = str(self.get_parameter("inject_command_topic").value)
+        self.inject_status_topic = str(self.get_parameter("inject_status_topic").value)
 
         self.all_messages_pub = self.create_publisher(String, self.topic_all_messages, 100)
         self.raw_bytes_pub = None
         if self.publish_raw_bytes:
             self.raw_bytes_pub = self.create_publisher(UInt8MultiArray, self.topic_raw_bytes, 100)
+        self.inject_status_pub = self.create_publisher(String, self.inject_status_topic, 10)
+        self.inject_command_sub = self.create_subscription(
+            String,
+            self.inject_command_topic,
+            self._inject_command_callback,
+            10,
+        )
 
         self.mav_conn = None
         self.mav_lock = threading.Lock()
@@ -155,6 +172,97 @@ class MavFirehoseNode(Node):
             )
         except Exception as exc:
             self.get_logger().warning(f"Failed to request data streams: {exc}")
+
+    def _set_param_and_verify(self, param_name, value):
+        if self.mav_conn is None:
+            return False, None, "not_connected"
+
+        try:
+            if isinstance(value, float):
+                param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+            else:
+                param_type = mavutil.mavlink.MAV_PARAM_TYPE_INT32
+
+            encoded = encode_param_value(value, param_type)
+
+            with self.mav_lock:
+                self.mav_conn.mav.param_set_send(
+                    self.mav_conn.target_system,
+                    mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1,
+                    param_name.encode("utf-8"),
+                    encoded,
+                    param_type,
+                )
+                time.sleep(0.1)
+                self.mav_conn.mav.param_request_read_send(
+                    self.mav_conn.target_system,
+                    self.mav_conn.target_component,
+                    param_name.encode("utf-8"),
+                    -1,
+                )
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    remaining = max(0.0, deadline - time.time())
+                    msg = self.mav_conn.recv_match(
+                        type="PARAM_VALUE",
+                        blocking=True,
+                        timeout=remaining,
+                    )
+                    if msg is None:
+                        return False, None, "no_response"
+                    if normalize_param_id(msg.param_id) != param_name:
+                        continue
+                    actual = decode_param_value(msg)
+                    if isinstance(value, float):
+                        ok = abs(float(actual) - float(value)) < 1e-4
+                    else:
+                        ok = int(actual) == int(value)
+                    if ok:
+                        return True, actual, None
+                    return False, actual, "mismatch"
+                return False, None, "timeout"
+        except Exception as exc:
+            return False, None, str(exc)
+
+    def _inject_command_callback(self, msg):
+        try:
+            command = json.loads(msg.data)
+        except Exception:
+            self.get_logger().warning("Inject command must be JSON")
+            return
+
+        if command.get("action", "set_params") != "set_params":
+            self.get_logger().warning(f"Unsupported inject action: {command.get('action')}")
+            return
+
+        params = command.get("params")
+        if not isinstance(params, dict):
+            single = command.get("param")
+            if single is None:
+                self.get_logger().warning("Inject command missing params")
+                return
+            params = {single: command.get("value")}
+
+        results = {}
+        details = {}
+        for param_name, param_value in params.items():
+            ok, actual, reason = self._set_param_and_verify(param_name, param_value)
+            results[param_name] = bool(ok)
+            detail = {"ok": bool(ok), "actual": actual}
+            if reason is not None:
+                detail["reason"] = reason
+            details[param_name] = detail
+
+        status_msg = String()
+        status_msg.data = json.dumps(
+            {
+                "action": "set_params",
+                "results": results,
+                "details": details,
+                "source": "firehose",
+            }
+        )
+        self.inject_status_pub.publish(status_msg)
 
     def _mavlink_loop(self):
         try:

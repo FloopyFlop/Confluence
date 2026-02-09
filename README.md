@@ -20,6 +20,7 @@ In console:
 ```text
 help
 list
+watch px4_injector/status std_msgs/msg/String
 fault 1
 clear
 ```
@@ -28,17 +29,26 @@ Important:
 - `fault <n>` publishes a forced fault event and injects fault params by default.
 - `clear` clears forced-fault state in the detector.
 - `clear` does not automatically restore PWM params.
+- Parameter writes from console/fault detector are executed by `firehose` on `px4_injector/command` so only one service owns the MAVLink serial link.
 
 Restore command template:
 ```text
 inject PWM_MAIN_FUNC1=101 PWM_MAIN_FUNC2=102 PWM_MAIN_FUNC3=103 PWM_MAIN_FUNC4=104
 ```
 
+Verification:
+- Watch `px4_injector/status` and confirm each param has `"ok": true`.
+- If you see `"ok": false` with `"reason": "no_response"` or `"reason": "not_connected"`, the FC write did not apply.
+
 ## Standard Commands
 Start stack (from `.drone-env` defaults):
 ```bash
 ros2 run confluence orchestrator --all
 ```
+
+Note:
+- `orchestrator` reads `.drone-env` from your current working directory.
+- If your env file is elsewhere, pass it explicitly: `--env-file /path/to/.drone-env`
 
 Override any defaults:
 ```bash
@@ -52,21 +62,16 @@ One-shot monolithic injection:
 ros2 run confluence monolithic_fault
 ```
 
-One-shot param hook:
-```bash
-ros2 run confluence inject_param --param PWM_MAIN_FUNC4 --value 101
-```
-
 Console fault hook:
 ```bash
 ros2 run confluence induce_fault --host <DRONE_IP> --port 9000 --motor 1
 ```
 
 ## Service Nodes
-- `firehose`: publishes MAVLink JSON on `mav/all_messages`
+- `firehose`: publishes MAVLink JSON on `mav/all_messages`, applies `px4_injector/command`, publishes `px4_injector/status`
 - `uniform_pump`: publishes batched data on `mav/uniform_batch`
 - `fault_detector`: publishes faults on `fault_detector/output`
-- `inject`: applies `px4_injector/command` and publishes `px4_injector/status`
+- `inject`: standalone direct injector on `px4_injector/direct_command` and `px4_injector/direct_status`
 - `orchestrator`: launches services and provides remote console bridge
 
 ## `.drone-env`
@@ -76,7 +81,6 @@ Path:
 Used by:
 - `monolithic_fault`
 - `inject`
-- `inject_param`
 - `orchestrator`
 
 Current keys:

@@ -3,9 +3,9 @@
 ROS2 Inject node.
 
 Single responsibility:
-- Subscribe to `px4_injector/command`
+- Subscribe to `px4_injector/direct_command`
 - Apply MAVLink PARAM_SET using the same logic as `monolithic_fault`
-- Publish result on `px4_injector/status`
+- Publish result on `px4_injector/direct_status`
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_msgs.msg import String
 
-from confluence.param_injection_core import (
+from confluence.utils.param_injection import (
     ParamInjectorClient,
     env_or_default,
     load_env_file,
@@ -35,8 +35,8 @@ class InjectNode(Node):
         self.declare_parameter("mavsdk_address", "")
         self.declare_parameter("timeout", 0.0)
         self.declare_parameter("skip_mavsdk", True)
-        self.declare_parameter("command_topic", "px4_injector/command")
-        self.declare_parameter("status_topic", "px4_injector/status")
+        self.declare_parameter("command_topic", "px4_injector/direct_command")
+        self.declare_parameter("status_topic", "px4_injector/direct_status")
 
         self._apply_cli_overrides(cli_args)
         self._client = self._build_client()
@@ -152,13 +152,21 @@ class InjectNode(Node):
 
         results: dict[str, bool] = {}
         details: dict[str, dict[str, object]] = {}
-        for param_name, param_value in params.items():
-            ok, actual, reason = self._client.set_and_verify(param_name, param_value)
-            results[param_name] = bool(ok)
-            detail: dict[str, object] = {"ok": bool(ok), "actual": actual}
-            if reason is not None:
-                detail["reason"] = reason
-            details[param_name] = detail
+        try:
+            for param_name, param_value in params.items():
+                ok, actual, reason = self._client.set_and_verify(param_name, param_value)
+                results[param_name] = bool(ok)
+                detail: dict[str, object] = {"ok": bool(ok), "actual": actual}
+                if reason is not None:
+                    detail["reason"] = reason
+                details[param_name] = detail
+        finally:
+            # Release serial ownership after each command to avoid long-lived
+            # contention with firehose when both target the same device.
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
         status_payload = {
             "action": "set_params",
