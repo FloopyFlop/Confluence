@@ -99,6 +99,11 @@ class MavFirehoseNode(Node):
         self.mav_conn = None
         self.mav_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._armed = False
+        self._pending_inject_commands = []
+        self._pending_lock = threading.Lock()
+        self._last_read_error_log = 0.0
+        self._read_error_count = 0
 
         if MAVLINK_AVAILABLE:
             self.mav_thread = threading.Thread(target=self._mavlink_loop, daemon=True)
@@ -224,6 +229,54 @@ class MavFirehoseNode(Node):
         except Exception as exc:
             return False, None, str(exc)
 
+    def _publish_inject_status(self, payload):
+        status_msg = String()
+        status_msg.data = json.dumps(payload)
+        self.inject_status_pub.publish(status_msg)
+
+    def _apply_inject_params(self, params, source="firehose", queued=False):
+        results = {}
+        details = {}
+        for param_name, param_value in params.items():
+            ok, actual, reason = self._set_param_and_verify(param_name, param_value)
+            results[param_name] = bool(ok)
+            detail = {"ok": bool(ok), "actual": actual}
+            if reason is not None:
+                detail["reason"] = reason
+            details[param_name] = detail
+
+        self._publish_inject_status(
+            {
+                "action": "set_params",
+                "results": results,
+                "details": details,
+                "source": source,
+                "queued": bool(queued),
+                "armed": bool(self._armed),
+            }
+        )
+
+    def _queue_inject_command(self, params, source):
+        with self._pending_lock:
+            self._pending_inject_commands.append(
+                {"params": params, "source": source, "queued_at": time.time()}
+            )
+
+    def _drain_pending_inject_commands(self):
+        if self._armed:
+            return
+        while True:
+            with self._pending_lock:
+                if not self._pending_inject_commands:
+                    return
+                cmd = self._pending_inject_commands.pop(0)
+            params = cmd.get("params", {})
+            source = cmd.get("source", "firehose")
+            self.get_logger().info(
+                f"Applying deferred inject command now disarmed: source={source} params={params}"
+            )
+            self._apply_inject_params(params, source=source, queued=True)
+
     def _inject_command_callback(self, msg):
         try:
             command = json.loads(msg.data)
@@ -243,26 +296,23 @@ class MavFirehoseNode(Node):
                 return
             params = {single: command.get("value")}
 
-        results = {}
-        details = {}
-        for param_name, param_value in params.items():
-            ok, actual, reason = self._set_param_and_verify(param_name, param_value)
-            results[param_name] = bool(ok)
-            detail = {"ok": bool(ok), "actual": actual}
-            if reason is not None:
-                detail["reason"] = reason
-            details[param_name] = detail
-
-        status_msg = String()
-        status_msg.data = json.dumps(
-            {
-                "action": "set_params",
-                "results": results,
-                "details": details,
-                "source": "firehose",
-            }
-        )
-        self.inject_status_pub.publish(status_msg)
+        source = str(command.get("source", "firehose"))
+        defer_until_disarmed = bool(command.get("defer_until_disarmed", False))
+        if defer_until_disarmed and self._armed:
+            self._queue_inject_command(params, source=source)
+            self._publish_inject_status(
+                {
+                    "action": "set_params",
+                    "queued": True,
+                    "armed": True,
+                    "results": {},
+                    "details": {},
+                    "source": source,
+                    "reason": "deferred_until_disarmed",
+                }
+            )
+            return
+        self._apply_inject_params(params, source=source, queued=False)
 
     def _mavlink_loop(self):
         try:
@@ -288,6 +338,20 @@ class MavFirehoseNode(Node):
                 msg_type = msg.get_type()
                 if msg_type == "BAD_DATA":
                     continue
+                if msg_type == "HEARTBEAT":
+                    try:
+                        armed_now = bool(
+                            msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                        )
+                    except Exception:
+                        armed_now = self._armed
+                    if armed_now != self._armed:
+                        self._armed = armed_now
+                        self.get_logger().info(
+                            f"Vehicle arm state changed: {'ARMED' if self._armed else 'DISARMED'}"
+                        )
+                    if not self._armed:
+                        self._drain_pending_inject_commands()
 
                 msg_dict = msg.to_dict()
                 msg_dict["_msg_type"] = msg_type
@@ -303,7 +367,15 @@ class MavFirehoseNode(Node):
                     raw_msg.data = list(raw)
                     self.raw_bytes_pub.publish(raw_msg)
             except Exception as exc:
-                self.get_logger().warning(f"Error reading MAVLink message: {exc}")
+                self._read_error_count += 1
+                now = time.time()
+                if now - self._last_read_error_log >= 2.0:
+                    self.get_logger().warning(
+                        "Error reading MAVLink message "
+                        f"(suppressed={max(0, self._read_error_count - 1)}): {exc}"
+                    )
+                    self._last_read_error_log = now
+                    self._read_error_count = 0
 
     def destroy_node(self):
         self._stop_event.set()

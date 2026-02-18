@@ -3,7 +3,7 @@
 Confluence Remote Console
 
 Connects to a running Confluence orchestrator over TCP to stream logs and send
-commands (fault injection, parameter updates, and service listing).
+commands (fault injection, parameter updates, topic watch/publish, and probes).
 
 Dependencies:
 - Python 3.8+
@@ -14,19 +14,22 @@ Usage examples:
 
 Commands (type at the prompt):
   list
+  probe                      (request fault-detector probe diagnostics)
   fault <index>              (1-4)
-  clear                       (clears forced fault and triggers restore params)
-  inject PARAM=VALUE ...      (publishes params to inject service)
-  motortest <on|off>          (sets COM_MOT_TEST_EN=1/0)
-  watch <topic> <type>        (stream a ROS2 topic, e.g. mav/uniform_batch std_msgs/msg/String)
+  clear                      (clears forced fault; restore params using detector defaults)
+  clear no-restore           (clear without restore)
+  clear now                  (clear and restore immediately, even if armed)
+  clear now no-restore       (force-clear only)
+  inject PARAM=VALUE ...
+  motortest <on|off>         (sets COM_MOT_TEST_EN=1/0)
+  watch <topic> <type>
   unwatch <topic>
-  pub <topic> <type> <json>   (publish raw JSON to a ROS2 topic)
-  send {json}                 (send raw JSON command)
+  pub <topic> <type> <json>
+  send {json}
   quit
-
-Type format:
-  std_msgs/msg/String  (or std_msgs.msg.String)
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -35,16 +38,35 @@ import sys
 import threading
 
 
-def _print(line):
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+PROMPT = "console> "
+PRINT_LOCK = threading.Lock()
+
+
+def _print(line: str):
+    with PRINT_LOCK:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
+def _print_async(line: str):
+    # Keep interactive input stable while background lines arrive.
+    with PRINT_LOCK:
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.write(line + "\n")
+        # Re-render prompt without duplicating partially typed commands.
+        sys.stdout.write(PROMPT)
+        sys.stdout.flush()
 
 
 def _print_help():
     _print("Commands:")
     _print("  list")
+    _print("  probe")
     _print("  fault <index>")
     _print("  clear")
+    _print("  clear no-restore")
+    _print("  clear now")
+    _print("  clear now no-restore")
     _print("  inject PARAM=VALUE ...")
     _print("  motortest <on|off>")
     _print("  watch <topic> <type>")
@@ -54,22 +76,25 @@ def _print_help():
     _print("  quit")
 
 
-def _parse_command(line):
+def _parse_command(line: str):
     line = line.strip()
     if not line:
         return None
     if line == "help":
         return {"cmd": "help"}
     if line.startswith("send "):
-        raw = line[len("send "):].strip()
+        raw = line[len("send ") :].strip()
         try:
             return json.loads(raw)
         except Exception:
             return {"cmd": "invalid", "raw": raw}
+
     parts = line.split()
     cmd = parts[0].lower()
     if cmd == "list":
         return {"cmd": "list"}
+    if cmd in ("probe", "run_probe"):
+        return {"cmd": "probe"}
     if cmd in ("fault", "inject_fault"):
         if len(parts) > 1:
             try:
@@ -78,7 +103,18 @@ def _parse_command(line):
                 return {"cmd": "fault", "fault_label": " ".join(parts[1:])}
         return {"cmd": "fault"}
     if cmd in ("clear", "clear_fault"):
-        return {"cmd": "clear_fault"}
+        out = {"cmd": "clear_fault"}
+        for token in parts[1:]:
+            t = token.strip().lower()
+            if t in ("now", "force", "immediate"):
+                out["defer_until_disarmed"] = False
+            elif t in ("defer", "safe"):
+                out["defer_until_disarmed"] = True
+            elif t in ("no-restore", "norestore", "keep"):
+                out["restore"] = False
+            elif t in ("restore",):
+                out["restore"] = True
+        return out
     if cmd in ("inject", "set_params"):
         params = {}
         for item in parts[1:]:
@@ -86,10 +122,7 @@ def _parse_command(line):
                 continue
             key, value = item.split("=", 1)
             try:
-                if "." in value:
-                    cast_val = float(value)
-                else:
-                    cast_val = int(value)
+                cast_val = float(value) if "." in value else int(value)
             except Exception:
                 cast_val = value
             params[key] = cast_val
@@ -135,31 +168,31 @@ def _reader(sock):
             try:
                 payload = json.loads(line)
             except Exception:
-                _print(line)
+                _print_async(line)
                 continue
 
             msg_type = payload.get("type")
             if msg_type == "log":
                 service = payload.get("service", "?")
                 text = payload.get("line", "")
-                _print(f"[{service}] {text}")
+                _print_async(f"[{service}] {text}")
             elif msg_type == "services":
                 services = ", ".join(payload.get("services", []))
-                _print(f"Services: {services}")
+                _print_async(f"Services: {services}")
             elif msg_type in ("info", "ack", "error", "event"):
-                _print(f"{msg_type.upper()}: {payload}")
+                _print_async(f"{msg_type.upper()}: {payload}")
             elif msg_type == "topic":
                 topic = payload.get("topic", "?")
                 message = payload.get("message")
-                _print(f"[{topic}] {message}")
+                _print_async(f"[{topic}] {message}")
             else:
-                _print(str(payload))
+                _print_async(str(payload))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Confluence Remote Console")
-    parser.add_argument("--host", required=True, help="Drone/orchestrator IP")
-    parser.add_argument("--port", type=int, required=True, help="Orchestrator console port")
+    parser.add_argument("--host", default="127.0.0.1", help="Drone/orchestrator IP")
+    parser.add_argument("--port", type=int, default=9000, help="Orchestrator console port")
     args = parser.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -171,7 +204,10 @@ def main():
     _print("Connected. Type 'help' for commands.")
     while True:
         try:
-            line = input("console> ")
+            line = input(PROMPT)
+        except KeyboardInterrupt:
+            _print("")
+            break
         except EOFError:
             break
         cmd = _parse_command(line)

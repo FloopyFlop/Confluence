@@ -18,8 +18,33 @@ from pymavlink import mavutil
 DEFAULT_ENV_FILE = ".drone-env"
 
 
+def resolve_env_file(path: str | None = None) -> Path:
+    requested = Path(path or DEFAULT_ENV_FILE)
+    candidates: list[Path] = []
+    if requested.is_absolute():
+        candidates.append(requested)
+    else:
+        cwd = Path.cwd()
+        candidates.append(cwd / requested)
+        candidates.append(cwd / "src" / "confluence" / requested)
+        module_path = Path(__file__).resolve()
+        for parent in module_path.parents:
+            candidates.append(parent / requested)
+            candidates.append(parent / "src" / "confluence" / requested)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        normalized = candidate.resolve()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if normalized.exists():
+            return normalized
+    return (Path.cwd() / requested).resolve()
+
+
 def load_env_file(path: str | None = None) -> dict[str, str]:
-    env_path = Path(path or DEFAULT_ENV_FILE)
+    env_path = resolve_env_file(path)
     if not env_path.exists():
         return {}
 

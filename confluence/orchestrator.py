@@ -38,6 +38,7 @@ Interactive commands (type in the orchestrator prompt):
 
 Remote console commands (via TCP):
   list
+  probe
   fault <1-4>
   clear
   inject PARAM=VALUE ...
@@ -111,6 +112,49 @@ def _load_env_file(path):
     return values
 
 
+def _resolve_env_file(path):
+    if not path:
+        return None
+
+    candidates = []
+    if os.path.isabs(path):
+        candidates.append(path)
+    else:
+        cwd = os.getcwd()
+        module_dir = os.path.dirname(os.path.realpath(__file__))
+        candidates.extend(
+            [
+                os.path.join(cwd, path),
+                os.path.join(cwd, "src", "confluence", path),
+                os.path.join(module_dir, path),
+                os.path.join(module_dir, "..", "..", "..", "src", "confluence", path),
+            ]
+        )
+
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.abspath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.exists(normalized):
+            return normalized
+    return os.path.abspath(candidates[0]) if candidates else None
+
+
+def _parse_bool(raw, default):
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def _env_or_default(explicit, env_values, key, default):
     if explicit is not None:
         return explicit
@@ -127,6 +171,12 @@ def _env_int(explicit, env_values, key, default):
         return int(raw)
     except Exception:
         return default
+
+
+def _env_bool(explicit, env_values, key, default):
+    if explicit is not None:
+        return bool(explicit)
+    return _parse_bool(env_values.get(key), default)
 
 
 class ManagedProcess:
@@ -270,7 +320,14 @@ def _print_line(line):
     sys.stdout.flush()
 
 
-def _drain_output(proc, data, attached_name, log_file, console_server=None):
+def _drain_output(
+    proc,
+    data,
+    attached_name,
+    log_file,
+    console_server=None,
+    stream_logs=False,
+):
     if not data:
         return
 
@@ -280,7 +337,7 @@ def _drain_output(proc, data, attached_name, log_file, console_server=None):
         raw_line, proc.log_buffer = proc.log_buffer.split(b"\n", 1)
         line = raw_line.decode("utf-8", errors="replace")
         _write_log(log_file, proc.name, line)
-        if console_server is not None:
+        if console_server is not None and stream_logs:
             console_server.broadcast({"type": "log", "service": proc.name, "line": line})
 
     # Display handling
@@ -363,9 +420,22 @@ def main(args=None):
         default=None,
         help="Console TCP port (default 9000, 0 disables)",
     )
+    parser.add_argument(
+        "--console-stream-logs",
+        action="store_true",
+        help="Stream service logs to remote console clients.",
+    )
+    parser.add_argument(
+        "--no-console-stream-logs",
+        action="store_true",
+        help="Do not stream service logs to remote console clients.",
+    )
 
     parsed = parser.parse_args(args=args)
-    env_values = _load_env_file(parsed.env_file)
+    env_file = _resolve_env_file(parsed.env_file)
+    env_values = _load_env_file(env_file)
+    if env_file and os.path.exists(env_file):
+        _print_line(f"Loaded runtime defaults: {env_file}")
 
     firehose_args = _env_or_default(
         parsed.firehose_args, env_values, "CONFLUENCE_FIREHOSE_ARGS", ""
@@ -384,6 +454,15 @@ def main(args=None):
     )
     console_port = _env_int(
         parsed.console_port, env_values, "CONFLUENCE_CONSOLE_PORT", 9000
+    )
+    if parsed.no_console_stream_logs:
+        explicit_stream_logs = False
+    elif parsed.console_stream_logs:
+        explicit_stream_logs = True
+    else:
+        explicit_stream_logs = None
+    console_stream_logs = _env_bool(
+        explicit_stream_logs, env_values, "CONFLUENCE_CONSOLE_STREAM_LOGS", False
     )
 
     services = []
@@ -411,6 +490,7 @@ def main(args=None):
         console_server = ConsoleServer(console_host, console_port, command_queue)
         console_server.start()
         _print_line(f"Console server listening on {console_host}:{console_port}")
+        _print_line(f"Console log streaming: {'enabled' if console_stream_logs else 'disabled'}")
 
     ros_node = None
     fault_pub = None
@@ -529,6 +609,8 @@ def main(args=None):
         cmd = parts[0].lower()
         if cmd == "list":
             return {"cmd": "list"}
+        if cmd in ("probe", "run_probe"):
+            return {"cmd": "probe"}
         if cmd in ("fault", "inject_fault"):
             if len(parts) > 1:
                 try:
@@ -537,7 +619,18 @@ def main(args=None):
                     return {"cmd": "fault", "fault_label": " ".join(parts[1:])}
             return {"cmd": "fault"}
         if cmd in ("clear", "clear_fault"):
-            return {"cmd": "clear_fault"}
+            out = {"cmd": "clear_fault"}
+            for token in parts[1:]:
+                t = token.strip().lower()
+                if t in ("now", "force", "immediate"):
+                    out["defer_until_disarmed"] = False
+                elif t in ("defer", "safe"):
+                    out["defer_until_disarmed"] = True
+                elif t in ("no-restore", "norestore", "keep"):
+                    out["restore"] = False
+                elif t in ("restore",):
+                    out["restore"] = True
+            return out
         if cmd in ("set_params", "inject"):
             params = {}
             for item in parts[1:]:
@@ -586,13 +679,37 @@ def main(args=None):
         if console_server is None:
             return
         cmd = payload.get("cmd", "")
+        fault_detector_running = "fault_detector" in processes
         if cmd == "invalid":
             console_server.send(client, {"type": "error", "message": "Invalid JSON"})
             return
         if cmd == "list":
             console_server.send(client, {"type": "services", "services": list(processes.keys())})
             return
+        if cmd == "probe":
+            if not fault_detector_running:
+                console_server.send(client, {"type": "error", "message": "fault_detector is not running"})
+                return
+            if fault_pub is None:
+                console_server.send(client, {"type": "error", "message": "Fault publisher not available"})
+                return
+            probe_id = int(time.time() * 1000)
+            ros_msg = String()
+            ros_msg.data = json.dumps({"action": "run_probe", "probe_id": probe_id})
+            fault_pub.publish(ros_msg)
+            console_server.send(
+                client,
+                {
+                    "type": "ack",
+                    "message": f"probe requested ({probe_id})",
+                    "probe_id": probe_id,
+                },
+            )
+            return
         if cmd == "fault":
+            if not fault_detector_running:
+                console_server.send(client, {"type": "error", "message": "fault_detector is not running"})
+                return
             if fault_pub is None:
                 console_server.send(client, {"type": "error", "message": "Fault publisher not available"})
                 return
@@ -611,6 +728,9 @@ def main(args=None):
             console_server.send(client, {"type": "ack", "message": "fault injected"})
             return
         if cmd == "clear_fault":
+            if not fault_detector_running:
+                console_server.send(client, {"type": "error", "message": "fault_detector is not running"})
+                return
             if fault_pub is None:
                 console_server.send(client, {"type": "error", "message": "Fault publisher not available"})
                 return
@@ -618,12 +738,22 @@ def main(args=None):
             clear_cmd = {"action": "clear_fault"}
             if "restore" in payload:
                 clear_cmd["restore"] = bool(payload.get("restore"))
+            if "defer_until_disarmed" in payload:
+                clear_cmd["defer_until_disarmed"] = bool(payload.get("defer_until_disarmed"))
             restore_params = payload.get("restore_params")
             if isinstance(restore_params, dict):
                 clear_cmd["restore_params"] = restore_params
             ros_msg.data = json.dumps(clear_cmd)
             fault_pub.publish(ros_msg)
-            console_server.send(client, {"type": "ack", "message": "fault cleared"})
+            restore_enabled = bool(clear_cmd.get("restore", True))
+            defer_enabled = bool(clear_cmd.get("defer_until_disarmed", True))
+            if not restore_enabled:
+                message = "fault cleared (no restore requested)"
+            elif defer_enabled:
+                message = "fault cleared (restore requested; deferred if armed)"
+            else:
+                message = "fault cleared (immediate restore requested)"
+            console_server.send(client, {"type": "ack", "message": message})
             return
         if cmd == "set_params":
             if inject_pub is None:
@@ -770,7 +900,14 @@ def main(args=None):
                     except OSError:
                         data = b""
                     if data:
-                        _drain_output(proc, data, attached, log_file, console_server)
+                        _drain_output(
+                            proc,
+                            data,
+                            attached,
+                            log_file,
+                            console_server,
+                            stream_logs=console_stream_logs,
+                        )
                     else:
                         selector.unregister(proc.master_fd)
                         os.close(proc.master_fd)
