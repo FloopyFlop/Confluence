@@ -38,6 +38,7 @@ setup(
             'orchestrator = confluence.orchestrator:main',
             'fault_hook = confluence.hooks.fault_hook:main',
             'fault_detector_probe = confluence.hooks.fault_detector_probe:main',
+            'fault_model_stream_check = confluence.hooks.fault_model_stream_check:main',
             # Backward-compatible alias.
             'monolithic_fault = confluence.hooks.fault_hook:main',
         ],

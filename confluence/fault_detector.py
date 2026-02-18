@@ -852,12 +852,14 @@ class FaultDetectorNode(Node):
             'motor 3 malfunction',
             'motor 4 malfunction',
         ]
-        # Keep demo behavior explicit: disable one mapped motor function.
+        # Align forced-fault motor indices with model fix mapping:
+        # motor 1 <-> PWM_MAIN_FUNC4, motor 2 <-> PWM_MAIN_FUNC1,
+        # motor 3 <-> PWM_MAIN_FUNC2, motor 4 <-> PWM_MAIN_FUNC3.
         parameter_fault = [
+            {'PWM_MAIN_FUNC4': 0},
             {'PWM_MAIN_FUNC1': 0},
             {'PWM_MAIN_FUNC2': 0},
             {'PWM_MAIN_FUNC3': 0},
-            {'PWM_MAIN_FUNC4': 0},
         ]
 
         idx = int(output - 1)

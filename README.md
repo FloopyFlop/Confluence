@@ -42,6 +42,7 @@ Important keys:
 Current defaults in `/Users/abm/XVOL/Cornell/MAGPIE/Confluence/.drone-env` already include:
 
 - firehose serial args
+- uniform pump `multi_step_count:=5` with nearest-sample multi-step packing (waterfall_local-compatible)
 - detector args in waterfall-compatible mode:
 - `require_flight_gate:=true` (armed + throttle-up required for inference)
 - `hold_model_fault_until_landing:=true` (latch first model fault during flight)
@@ -136,6 +137,11 @@ Notes:
 - motor 2 -> `PWM_MAIN_FUNC1=102`
 - motor 3 -> `PWM_MAIN_FUNC2=103`
 - motor 4 -> `PWM_MAIN_FUNC3=104`
+- Forced fault mapping (`fault <index>`) is aligned to the same motor map:
+- `fault 1` -> `PWM_MAIN_FUNC4=0`
+- `fault 2` -> `PWM_MAIN_FUNC1=0`
+- `fault 3` -> `PWM_MAIN_FUNC2=0`
+- `fault 4` -> `PWM_MAIN_FUNC3=0`
 
 ## Fault Detector Probe Hook
 
@@ -161,6 +167,20 @@ Useful options:
 ros2 run confluence fault_detector_probe --probe-only
 ros2 run confluence fault_detector_probe --fault-index 3 --timeout 25
 ros2 run confluence fault_detector_probe --no-inject-status-check
+```
+
+## Model Stream Check Hook
+
+Validates model input/output pipeline directly from detector diagnostics/output.
+
+```bash
+ros2 run confluence fault_model_stream_check --duration 10
+```
+
+Inject + observe label in one run:
+
+```bash
+ros2 run confluence fault_model_stream_check --inject-fault-index 1 --duration 12 --clear-at-end
 ```
 
 ## Fault Hook

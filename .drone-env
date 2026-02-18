@@ -15,7 +15,7 @@ CONFLUENCE_FAULT_VALUE=0
 
 # Orchestrator defaults.
 CONFLUENCE_FIREHOSE_ARGS="--serial-port /dev/ttyTHS3 --serial-baud 115200"
-CONFLUENCE_UNIFORM_PUMP_ARGS=""
+CONFLUENCE_UNIFORM_PUMP_ARGS="--ros-args -p condensation_mode:=multi_step -p multi_step_count:=5"
 CONFLUENCE_INJECT_ARGS=""
 CONFLUENCE_FAULT_DETECTOR_ARGS="--ros-args -p publish_inject_command:=false -p require_flight_gate:=true -p hold_model_fault_until_landing:=true -p auto_apply_model_fix_after_landing:=true -p model_confidence_threshold:=0.0 -p model_vote_window:=1 -p model_vote_required:=1 -p enable_diagnostics:=true -p diagnostics_every_n:=5"
 CONFLUENCE_CONSOLE_HOST=0.0.0.0

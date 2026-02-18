@@ -39,6 +39,7 @@ class UniformPumpNode(Node):
         self.declare_parameter('batch_interval', 0.2)
         self.declare_parameter('condensation_mode', 'multi_step')
         self.declare_parameter('multi_step_count', 3)
+        self.declare_parameter('multi_step_strategy', 'nearest')
         self.declare_parameter('bleeding_domain_duration', 15.0)
         self.declare_parameter('missing_data_strategy', 'bleeding_average')
         self.declare_parameter('input_topic', 'mav/all_messages')
@@ -47,6 +48,7 @@ class UniformPumpNode(Node):
         self.batch_interval = float(self.get_parameter('batch_interval').value)
         self.condensation_mode = str(self.get_parameter('condensation_mode').value)
         self.multi_step_count = int(self.get_parameter('multi_step_count').value)
+        self.multi_step_strategy = str(self.get_parameter('multi_step_strategy').value).strip().lower()
         self.bleeding_domain_duration = float(self.get_parameter('bleeding_domain_duration').value)
         self.missing_data_strategy = str(self.get_parameter('missing_data_strategy').value)
 
@@ -77,6 +79,8 @@ class UniformPumpNode(Node):
         self.get_logger().info('Uniform Pump started')
         self.get_logger().info(f'Batch interval: {self.batch_interval}s')
         self.get_logger().info(f'Condensation mode: {self.condensation_mode}')
+        if self.condensation_mode == 'multi_step':
+            self.get_logger().info(f'Multi-step strategy: {self.multi_step_strategy}')
 
     def _map_msg_type(self, msg_type: str) -> str:
         if not msg_type:
@@ -121,7 +125,6 @@ class UniformPumpNode(Node):
                 packaged_data = self._package_raw(batch_data)
             elif self.condensation_mode == 'multi_step':
                 packaged_data = self._package_multi_step(batch_data)
-                packaged_data['data']['timestamps'] = self._derive_step_timestamps(batch_data)
             elif self.condensation_mode == 'single_step':
                 packaged_data = self._package_single_step(batch_data)
             else:
@@ -156,6 +159,29 @@ class UniformPumpNode(Node):
         return packaged
 
     def _package_multi_step(self, batch_data):
+        if self.multi_step_strategy == 'bucket_average':
+            return self._package_multi_step_bucket_average(batch_data)
+
+        packaged = {'data': {}}
+        anchor_timestamps = self._derive_step_timestamps(batch_data)
+        all_msg_types = set(batch_data.keys()) | set(self.bleeding_domain.keys())
+        for msg_type in all_msg_types:
+            messages = self._collect_candidates(msg_type, batch_data)
+            if not messages:
+                continue
+            steps = []
+            for ts in anchor_timestamps:
+                closest = min(
+                    messages,
+                    key=lambda msg: abs(self._float_or_default(msg.get('_timestamp'), ts) - ts),
+                )
+                steps.append(self._strip_private_fields(closest))
+            packaged['data'][msg_type] = steps
+
+        packaged['data']['timestamps'] = anchor_timestamps
+        return packaged
+
+    def _package_multi_step_bucket_average(self, batch_data):
         packaged = {'data': {}}
         for msg_type, messages in batch_data.items():
             if not messages:
@@ -181,7 +207,36 @@ class UniformPumpNode(Node):
             packaged['data'][msg_type] = averaged_steps
 
         packaged['data'] = self._fill_missing_data(packaged['data'], batch_data.keys())
+        packaged['data']['timestamps'] = self._derive_step_timestamps(batch_data)
         return packaged
+
+    def _collect_candidates(self, msg_type, batch_data):
+        candidates = []
+        current = batch_data.get(msg_type, [])
+        if isinstance(current, list):
+            for msg in current:
+                if isinstance(msg, dict):
+                    candidates.append(msg)
+        history = self.bleeding_domain.get(msg_type)
+        if history:
+            for _, msg in history:
+                if isinstance(msg, dict):
+                    candidates.append(msg)
+        # Keep only recent candidates to avoid O(n) growth in nearest lookup.
+        if len(candidates) > 300:
+            candidates = candidates[-300:]
+        return candidates
+
+    def _strip_private_fields(self, msg):
+        if not isinstance(msg, dict):
+            return msg
+        return {k: v for k, v in msg.items() if not k.startswith('_')}
+
+    def _float_or_default(self, value, default):
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
 
     def _package_single_step(self, batch_data):
         packaged = {'data': {}}
@@ -259,17 +314,26 @@ class UniformPumpNode(Node):
 
     def _derive_step_timestamps(self, batch_data):
         anchors = ['attitude', 'imu', 'attitude_quat']
-        anchor_msgs = None
+        anchor_timestamps = []
         for key in anchors:
             if key in batch_data and batch_data[key]:
-                anchor_msgs = batch_data[key]
+                anchor_timestamps.extend(
+                    self._float_or_default(msg.get('_timestamp'), time.time())
+                    for msg in batch_data[key]
+                    if isinstance(msg, dict)
+                )
+            if key in self.bleeding_domain and self.bleeding_domain[key]:
+                anchor_timestamps.extend(
+                    self._float_or_default(ts, time.time())
+                    for ts, _ in self.bleeding_domain[key]
+                )
+            if anchor_timestamps:
                 break
 
-        if not anchor_msgs:
+        if not anchor_timestamps:
             return [time.time()] * self.multi_step_count
 
-        timestamps = [msg.get('_timestamp', time.time()) for msg in anchor_msgs]
-        timestamps = sorted(timestamps)
+        timestamps = sorted(anchor_timestamps)
         if len(timestamps) >= self.multi_step_count:
             return timestamps[-self.multi_step_count:]
         if timestamps:

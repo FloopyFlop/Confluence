@@ -28,10 +28,10 @@ from std_msgs.msg import String
 
 
 FAULT_PARAM_BY_INDEX = {
-    1: "PWM_MAIN_FUNC1",
-    2: "PWM_MAIN_FUNC2",
-    3: "PWM_MAIN_FUNC3",
-    4: "PWM_MAIN_FUNC4",
+    1: "PWM_MAIN_FUNC4",
+    2: "PWM_MAIN_FUNC1",
+    3: "PWM_MAIN_FUNC2",
+    4: "PWM_MAIN_FUNC3",
 }
 
 
