@@ -169,20 +169,6 @@ ros2 run confluence fault_detector_probe --fault-index 3 --timeout 25
 ros2 run confluence fault_detector_probe --no-inject-status-check
 ```
 
-## Model Stream Check Hook
-
-Validates model input/output pipeline directly from detector diagnostics/output.
-
-```bash
-ros2 run confluence fault_model_stream_check --duration 10
-```
-
-Inject + observe label in one run:
-
-```bash
-ros2 run confluence fault_model_stream_check --inject-fault-index 1 --duration 12 --clear-at-end
-```
-
 ## Fault Hook
 
 Unified hook entrypoint:
