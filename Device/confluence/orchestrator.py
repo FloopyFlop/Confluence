@@ -646,15 +646,6 @@ def main(args=None):
                     cast_val = value
                 params[key] = cast_val
             return {"cmd": "set_params", "params": params}
-        if cmd == "motortest":
-            if len(parts) < 2:
-                return {"cmd": "motortest"}
-            state = parts[1].strip().lower()
-            if state in ("on", "enable", "enabled", "1", "true"):
-                return {"cmd": "set_params", "params": {"COM_MOT_TEST_EN": 1}}
-            if state in ("off", "disable", "disabled", "0", "false"):
-                return {"cmd": "set_params", "params": {"COM_MOT_TEST_EN": 0}}
-            return {"cmd": "motortest", "value": state}
         if cmd == "watch":
             if len(parts) < 3:
                 return {"cmd": "watch"}
@@ -764,9 +755,6 @@ def main(args=None):
             ros_msg.data = json.dumps({"action": "set_params", "params": params})
             inject_pub.publish(ros_msg)
             console_server.send(client, {"type": "ack", "message": "inject sent"})
-            return
-        if cmd == "motortest":
-            console_server.send(client, {"type": "error", "message": "Usage: motortest on|off"})
             return
         if cmd == "watch":
             if ros_node is None:

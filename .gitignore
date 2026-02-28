@@ -5,3 +5,6 @@ build
 install
 log
 *.ckpt
+node_modules
+UI/node_modules
+UI/package-lock.json
